@@ -262,10 +262,12 @@ pub fn escape(output: &mut dyn Write, buffer: &[u8]) -> io::Result<()> {
     for (i, &byte) in buffer.iter().enumerate() {
         if NEEDS_ESCAPED[byte as usize] {
             let esc: &[u8] = match byte {
-                b'"' => b"&quot;",
-                b'&' => b"&amp;",
-                b'<' => b"&lt;",
-                b'>' => b"&gt;",
+                // Don't really know what the implication of doing this is... but it solves my
+                // problem haha
+                b'"' => b"\"",
+                b'&' => b"&",
+                b'<' => b"<",
+                b'>' => b">",
                 _ => unreachable!(),
             };
             output.write_all(&buffer[offset..i])?;

@@ -161,15 +161,21 @@ impl<'o> XmlFormatter<'o> {
                     was_literal = true;
                 }
                 NodeValue::List(ref nl) => {
-                    if nl.list_type == ListType::Bullet {
-                        self.output.write_all(b" type=\"bullet\"")?;
-                    } else {
-                        write!(
-                            self.output,
-                            " type=\"ordered\" start=\"{}\" delim=\"{}\"",
-                            nl.start,
-                            nl.delimiter.xml_name()
-                        )?;
+                    match nl.list_type {
+                        ListType::Bullet => {
+                            self.output.write_all(b" type=\"bullet\"")?;
+                        }
+                        ListType::Ordered => {
+                            write!(
+                                self.output,
+                                " type=\"ordered\" start=\"{}\" delim=\"{}\"",
+                                nl.start,
+                                nl.delimiter.xml_name()
+                            )?;
+                        }
+                    }
+                    if nl.is_task_list {
+                        self.output.write_all(b" tasklist=\"true\"")?;
                     }
                     write!(self.output, " tight=\"{}\"", nl.tight)?;
                 }
@@ -256,7 +262,7 @@ impl<'o> XmlFormatter<'o> {
                 #[cfg(feature = "shortcodes")]
                 NodeValue::ShortCode(ref nsc) => {
                     self.output.write_all(b" id=\"")?;
-                    self.escape(nsc.shortcode().as_bytes())?;
+                    self.escape(nsc.code.as_bytes())?;
                     self.output.write_all(b"\"")?;
                 }
                 NodeValue::Escaped => {
@@ -272,6 +278,16 @@ impl<'o> XmlFormatter<'o> {
                     self.escape(math.literal.as_bytes())?;
                     write!(self.output, "</{}", ast.value.xml_node_name())?;
                     was_literal = true;
+                }
+                NodeValue::WikiLink(ref nl) => {
+                    self.output.write_all(b" destination=\"")?;
+                    self.escape(nl.url.as_bytes())?;
+                    self.output.write_all(b"\"")?;
+                }
+                NodeValue::Underline => {}
+                NodeValue::SpoileredText => {}
+                NodeValue::EscapedTag(ref data) => {
+                    self.output.write_all(data.as_bytes())?;
                 }
             }
 

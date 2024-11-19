@@ -1,3 +1,7 @@
+use std::sync::{Arc, Mutex};
+
+use parser::BrokenLinkReference;
+
 use crate::{
     adapters::{HeadingAdapter, HeadingMeta, SyntaxHighlighterAdapter},
     nodes::Sourcepos,
@@ -27,46 +31,83 @@ fn exercise_full_api() {
 
     let _: &AstNode = parse_document(&arena, "document", &default_options);
 
+    // Ensure the closure can modify its context.
+    let blr_ctx_0 = Arc::new(Mutex::new(0));
+    let blr_ctx_1 = blr_ctx_0.clone();
+    #[allow(deprecated)]
     let _: &AstNode = parse_document_with_broken_link_callback(
         &arena,
         "document",
-        &default_options,
-        Some(&mut |_: &str| Some(("abc".to_string(), "xyz".to_string()))),
+        &Options::default(),
+        Arc::new(move |blr: BrokenLinkReference| {
+            *blr_ctx_1.lock().unwrap() += 1;
+            let _: &str = blr.normalized;
+            let _: &str = blr.original;
+            Some(ResolvedReference {
+                url: String::new(),
+                title: String::new(),
+            })
+        }),
     );
 
-    let mut extension = ExtensionOptionsBuilder::default();
-    extension.strikethrough(false);
-    extension.tagfilter(false);
-    extension.table(false);
-    extension.autolink(false);
-    extension.tasklist(false);
-    extension.superscript(false);
-    extension.header_ids(Some("abc".to_string()));
-    extension.footnotes(false);
-    extension.description_lists(false);
-    extension.multiline_block_quotes(false);
-    extension.math_dollars(false);
-    extension.math_code(false);
-    extension.front_matter_delimiter(None);
+    let extension = ExtensionOptions::builder()
+        .strikethrough(false)
+        .tagfilter(false)
+        .table(false)
+        .autolink(false)
+        .tasklist(false)
+        .superscript(false)
+        .header_ids("abc".to_string())
+        .footnotes(false)
+        .description_lists(false)
+        .math_dollars(false)
+        .math_code(false)
+        .maybe_front_matter_delimiter(None)
+        .multiline_block_quotes(false);
+
     #[cfg(feature = "shortcodes")]
-    extension.shortcodes(true);
+    let extension = extension.shortcodes(true);
 
-    let mut parse = ParseOptionsBuilder::default();
-    parse.smart(false);
-    parse.default_info_string(Some("abc".to_string()));
-    parse.relaxed_tasklist_matching(false);
-    parse.relaxed_autolinks(false);
+    let _extension = extension
+        .wikilinks_title_after_pipe(true)
+        .wikilinks_title_before_pipe(true)
+        .underline(true)
+        .spoiler(true)
+        .greentext(true);
 
-    let mut render = RenderOptionsBuilder::default();
-    render.hardbreaks(false);
-    render.github_pre_lang(false);
-    render.full_info_string(false);
-    render.width(123456);
-    render.unsafe_(false);
-    render.escape(false);
-    render.list_style(ListStyleType::Dash);
-    render.sourcepos(false);
-    render.escaped_char_spans(false);
+    let parse = ParseOptions::builder()
+        .smart(false)
+        .default_info_string("abc".to_string())
+        .relaxed_tasklist_matching(false)
+        .relaxed_autolinks(false);
+
+    let blr_ctx_1 = blr_ctx_0.clone();
+    let _parse = parse.broken_link_callback(Arc::new(move |blr: BrokenLinkReference| {
+        *blr_ctx_1.lock().unwrap() += 1;
+        let _: &str = blr.normalized;
+        let _: &str = blr.original;
+        Some(ResolvedReference {
+            url: String::new(),
+            title: String::new(),
+        })
+    }));
+
+    let _render = RenderOptions::builder()
+        .hardbreaks(false)
+        .github_pre_lang(false)
+        .full_info_string(false)
+        .width(123456)
+        .unsafe_(false)
+        .escape(false)
+        .list_style(ListStyleType::Dash)
+        .sourcepos(false)
+        .experimental_inline_sourcepos(false)
+        .escaped_char_spans(false)
+        .ignore_setext(true)
+        .ignore_empty_links(true)
+        .gfm_quirks(true)
+        .prefer_fenced(true)
+        .figure_with_caption(true);
 
     pub struct MockAdapter {}
     impl SyntaxHighlighterAdapter for MockAdapter {
@@ -113,12 +154,11 @@ fn exercise_full_api() {
 
     let mock_adapter = MockAdapter {};
 
-    let mut render_plugins = RenderPluginsBuilder::default();
-    render_plugins.codefence_syntax_highlighter(Some(&mock_adapter));
-    render_plugins.heading_adapter(Some(&mock_adapter));
+    let render_plugins = RenderPlugins::builder()
+        .codefence_syntax_highlighter(&mock_adapter)
+        .heading_adapter(&mock_adapter);
 
-    let mut plugins = PluginsBuilder::default();
-    plugins.render(render_plugins.build().unwrap());
+    let _plugins = Plugins::builder().render(render_plugins.build());
 
     let _: String = markdown_to_html("# Yes", &default_options);
 
@@ -209,8 +249,9 @@ fn exercise_full_api() {
             let _: String = nl.title;
         }
         #[cfg(feature = "shortcodes")]
-        nodes::NodeValue::ShortCode(ne) => {
-            let _: &str = ne.shortcode();
+        nodes::NodeValue::ShortCode(nsc) => {
+            let _: String = nsc.code;
+            let _: String = nsc.emoji;
         }
         nodes::NodeValue::FootnoteReference(nfr) => {
             let _: String = nfr.name;
@@ -225,6 +266,14 @@ fn exercise_full_api() {
             let _: bool = math.display_math;
             let _: bool = math.dollar_math;
             let _: String = math.literal;
+        }
+        nodes::NodeValue::WikiLink(nl) => {
+            let _: String = nl.url;
+        }
+        nodes::NodeValue::Underline => {}
+        nodes::NodeValue::SpoileredText => {}
+        nodes::NodeValue::EscapedTag(data) => {
+            let _: &String = data;
         }
     }
 }

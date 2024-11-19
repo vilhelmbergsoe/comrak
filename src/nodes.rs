@@ -108,7 +108,7 @@ pub enum NodeValue {
     /// in a document will be contained in a `Text` node.
     Text(String),
 
-    /// **Inline**. [Task list item](https://github.github.com/gfm/#task-list-items-extension-).
+    /// **Block**. [Task list item](https://github.github.com/gfm/#task-list-items-extension-).
     /// The value is the symbol that was used in the brackets to mark a task item as checked, or
     /// None if the item is unchecked.
     TaskItem(Option<char>),
@@ -182,6 +182,19 @@ pub enum NodeValue {
 
     /// **Inline**.  A character that has been [escaped](https://github.github.com/gfm/#backslash-escapes)
     Escaped,
+
+    /// **Inline**.  A wikilink to some URL.
+    WikiLink(NodeWikiLink),
+
+    /// **Inline**.  Underline. Enabled with `underline` option.
+    Underline,
+
+    /// **Inline**.  Spoilered text.  Enabled with `spoiler` option.
+    SpoileredText,
+
+    /// **Inline**. Text surrounded by escaped markup. Enabled with `spoiler` option.
+    /// The `String` is the tag to be escaped.
+    EscapedTag(String),
 }
 
 /// Alignment of a single table cell.
@@ -253,6 +266,13 @@ pub struct NodeLink {
     pub title: String,
 }
 
+/// The details of a wikilink's destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeWikiLink {
+    /// The URL for the link destination.
+    pub url: String,
+}
+
 /// The metadata of a list; the kind of list, the delimiter used and so on.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NodeList {
@@ -277,6 +297,9 @@ pub struct NodeList {
     /// Whether the list is [tight](https://github.github.com/gfm/#tight), i.e. whether the
     /// paragraphs are wrapped in `<p>` tags when formatted as HTML.
     pub tight: bool,
+
+    /// Whether the list contains tasks (checkbox items)
+    pub is_task_list: bool,
 }
 
 /// The metadata of a description list
@@ -489,6 +512,10 @@ impl NodeValue {
             NodeValue::MultilineBlockQuote(_) => "multiline_block_quote",
             NodeValue::Escaped => "escaped",
             NodeValue::Math(..) => "math",
+            NodeValue::WikiLink(..) => "wikilink",
+            NodeValue::Underline => "underline",
+            NodeValue::SpoileredText => "spoiler",
+            NodeValue::EscapedTag(_) => "escaped_tag",
         }
     }
 }
@@ -510,6 +537,7 @@ pub struct Ast {
     pub(crate) open: bool,
     pub(crate) last_line_blank: bool,
     pub(crate) table_visited: bool,
+    pub(crate) line_offsets: Vec<usize>,
 }
 
 /// Represents the position in the source Markdown this node was rendered from.
@@ -547,7 +575,7 @@ impl From<(usize, usize, usize, usize)> for Sourcepos {
 }
 
 /// Represents the 1-based line and column positions of a given character.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LineColumn {
     /// The 1-based line number of the character.
     pub line: usize,
@@ -585,15 +613,106 @@ impl Ast {
             open: true,
             last_line_blank: false,
             table_visited: false,
+            line_offsets: Vec::with_capacity(0),
         }
     }
 }
 
 /// The type of a node within the document.
 ///
-/// It is bound by the lifetime `'a`, which corresponds to the `Arena` nodes are allocated in.
-/// Child `Ast`s are wrapped in `RefCell` for interior mutability.
+/// It is bound by the lifetime `'a`, which corresponds to the `Arena` nodes are
+/// allocated in. Child `Ast`s are wrapped in `RefCell` for interior mutability.
+///
+/// You can construct a new `AstNode` from a `NodeValue` using the `From` trait:
+///
+/// ```no_run
+/// # use comrak::nodes::{AstNode, NodeValue};
+/// let root = AstNode::from(NodeValue::Document);
+/// ```
+///
+/// Note that no sourcepos information is given to the created node. If you wish
+/// to assign sourcepos information, use the `From` trait to create an `AstNode`
+/// from an `Ast`:
+///
+/// ```no_run
+/// # use comrak::nodes::{Ast, AstNode, NodeValue};
+/// let root = AstNode::from(Ast::new(
+///     NodeValue::Paragraph,
+///     (4, 1).into(), // start_line, start_col
+/// ));
+/// ```
+///
+/// Adjust the `end` position manually.
+///
+/// For practical use, you'll probably need it allocated in an `Arena`, in which
+/// case you can use `.into()` to simplify creation:
+///
+/// ```no_run
+/// # use comrak::{nodes::{AstNode, NodeValue}, Arena};
+/// # let arena = Arena::<AstNode>::new();
+/// let node_in_arena = arena.alloc(NodeValue::Document.into());
+/// ```
 pub type AstNode<'a> = Node<'a, RefCell<Ast>>;
+
+impl<'a> From<NodeValue> for AstNode<'a> {
+    /// Create a new AST node with the given value. The sourcepos is set to (0,0)-(0,0).
+    fn from(value: NodeValue) -> Self {
+        Node::new(RefCell::new(Ast::new(value, LineColumn::default())))
+    }
+}
+
+impl<'a> From<Ast> for AstNode<'a> {
+    /// Create a new AST node with the given Ast.
+    fn from(ast: Ast) -> Self {
+        Node::new(RefCell::new(ast))
+    }
+}
+
+/// Validation errors produced by [Node::validate].
+#[derive(Debug, Clone)]
+pub enum ValidationError<'a> {
+    /// The type of a child node is not allowed in the parent node. This can happen when an inline
+    /// node is found in a block container, a block is found in an inline node, etc.
+    InvalidChildType {
+        /// The parent node.
+        parent: &'a AstNode<'a>,
+        /// The child node.
+        child: &'a AstNode<'a>,
+    },
+}
+
+impl<'a> Node<'a, RefCell<Ast>> {
+    /// The comrak representation of a markdown node in Rust isn't strict enough to rule out
+    /// invalid trees according to the CommonMark specification. One simple example is that block
+    /// containers, such as lists, should only contain blocks, but it's possible to put naked
+    /// inline text in a list item. Such invalid trees can lead comrak to generate incorrect output
+    /// if rendered.
+    ///
+    /// This method performs additional structural checks to ensure that a markdown AST is valid
+    /// according to the CommonMark specification.
+    ///
+    /// Note that those invalid trees can only be generated programmatically. Parsing markdown with
+    /// comrak, on the other hand, should always produce a valid tree.
+    pub fn validate(&'a self) -> Result<(), ValidationError<'a>> {
+        let mut stack = vec![self];
+
+        while let Some(node) = stack.pop() {
+            // Check that this node type is valid wrt to the type of its parent.
+            if let Some(parent) = node.parent() {
+                if !can_contain_type(parent, &node.data.borrow().value) {
+                    return Err(ValidationError::InvalidChildType {
+                        parent,
+                        child: node,
+                    });
+                }
+            }
+
+            stack.extend(node.children());
+        }
+
+        Ok(())
+    }
+}
 
 pub(crate) fn last_child_is_open<'a>(node: &'a AstNode<'a>) -> bool {
     node.last_child().map_or(false, |n| n.data.borrow().open)
@@ -639,7 +758,17 @@ pub fn can_contain_type<'a>(node: &'a AstNode<'a>, child: &NodeValue) -> bool {
         | NodeValue::Emph
         | NodeValue::Strong
         | NodeValue::Link(..)
-        | NodeValue::Image(..) => !child.block(),
+        | NodeValue::Image(..)
+        | NodeValue::WikiLink(..)
+        | NodeValue::Strikethrough
+        | NodeValue::Superscript
+        | NodeValue::SpoileredText
+        | NodeValue::Underline
+        // XXX: this is quite a hack: the EscapedTag _contains_ whatever was
+        // possibly going to fall into the spoiler. This should be fixed in
+        // inlines.
+        | NodeValue::EscapedTag(_)
+        => !child.block(),
 
         NodeValue::Table(..) => matches!(*child, NodeValue::TableRow(..)),
 
@@ -657,21 +786,31 @@ pub fn can_contain_type<'a>(node: &'a AstNode<'a>, child: &NodeValue) -> bool {
                 | NodeValue::Strikethrough
                 | NodeValue::HtmlInline(..)
                 | NodeValue::Math(..)
+                | NodeValue::WikiLink(..)
+                | NodeValue::FootnoteReference(..)
+                | NodeValue::Superscript
+                | NodeValue::SpoileredText
+                | NodeValue::Underline
         ),
 
         #[cfg(feature = "shortcodes")]
         NodeValue::TableCell => matches!(
             *child,
             NodeValue::Text(..)
-                | NodeValue::Code(..)
-                | NodeValue::Emph
-                | NodeValue::Strong
-                | NodeValue::Link(..)
-                | NodeValue::Image(..)
-                | NodeValue::ShortCode(..)
-                | NodeValue::Strikethrough
-                | NodeValue::HtmlInline(..)
-                | NodeValue::Math(..)
+            | NodeValue::Code(..)
+            | NodeValue::Emph
+            | NodeValue::Strong
+            | NodeValue::Link(..)
+            | NodeValue::Image(..)
+            | NodeValue::Strikethrough
+            | NodeValue::HtmlInline(..)
+            | NodeValue::Math(..)
+            | NodeValue::WikiLink(..)
+            | NodeValue::FootnoteReference(..)
+            | NodeValue::Superscript
+            | NodeValue::SpoileredText
+            | NodeValue::Underline
+            | NodeValue::ShortCode(..)
         ),
 
         NodeValue::MultilineBlockQuote(_) => {

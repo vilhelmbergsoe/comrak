@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 
 #[test]
@@ -60,5 +62,29 @@ fn smart_chars() {
         [parse.smart],
         "Hm. Hm.. hm... yes- indeed-- quite---!",
         "<p>Hm. Hm.. hm… yes- indeed– quite—!</p>\n",
+    );
+}
+
+#[test]
+fn broken_link_callback() {
+    let cb = |link_ref: BrokenLinkReference| match link_ref.normalized {
+        "foo" => Some(ResolvedReference {
+            url: "https://www.rust-lang.org/".to_string(),
+            title: "The Rust Language".to_string(),
+        }),
+        _ => None,
+    };
+    let mut options = Options::default();
+    options.parse.broken_link_callback = Some(Arc::new(cb));
+
+    let output = markdown_to_html(
+        "# Cool input!\nWow look at this cool [link][foo]. A [broken link] renders as text.",
+        &options,
+    );
+    assert_eq!(
+        output,
+        "<h1>Cool input!</h1>\n<p>Wow look at this cool \
+        <a href=\"https://www.rust-lang.org/\" title=\"The Rust Language\">link</a>. \
+        A [broken link] renders as text.</p>\n"
     );
 }

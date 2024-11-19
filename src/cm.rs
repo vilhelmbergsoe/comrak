@@ -1,9 +1,9 @@
 use crate::ctype::{isalpha, isdigit, ispunct, isspace};
-use crate::nodes::TableAlignment;
 use crate::nodes::{
     AstNode, ListDelimType, ListType, NodeCodeBlock, NodeHeading, NodeHtmlBlock, NodeLink,
-    NodeMath, NodeTable, NodeValue,
+    NodeMath, NodeTable, NodeValue, NodeWikiLink,
 };
+use crate::nodes::{NodeList, TableAlignment};
 #[cfg(feature = "shortcodes")]
 use crate::parser::shortcodes::NodeShortCode;
 use crate::parser::Options;
@@ -20,6 +20,14 @@ pub fn format_document<'a>(
     options: &Options,
     output: &mut dyn Write,
 ) -> io::Result<()> {
+    // Formatting an ill-formed AST might lead to invalid output. However, we don't want to pay for
+    // validation in normal workflow. As a middleground, we validate the AST in debug builds. See
+    // https://github.com/kivikakk/comrak/issues/371.
+    #[cfg(debug_assertions)]
+    root.validate().unwrap_or_else(|e| {
+        panic!("The document to format is ill-formed: {:?}", e);
+    });
+
     format_document_with_plugins(root, options, output, &Plugins::default())
 }
 
@@ -53,6 +61,7 @@ struct CommonMarkFormatter<'a, 'o> {
     in_tight_list_item: bool,
     custom_escape: Option<fn(&'a AstNode<'a>, u8) -> bool>,
     footnote_ix: u32,
+    ol_stack: Vec<usize>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -90,6 +99,7 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
             in_tight_list_item: false,
             custom_escape: None,
             footnote_ix: 0,
+            ol_stack: vec![],
         }
     }
 
@@ -385,6 +395,10 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
                 // noop - automatic escaping is already being done
             }
             NodeValue::Math(ref math) => self.format_math(math, allow_wrap, entering),
+            NodeValue::WikiLink(ref nl) => return self.format_wikilink(nl, entering),
+            NodeValue::Underline => self.format_underline(),
+            NodeValue::SpoileredText => self.format_spoiler(),
+            NodeValue::EscapedTag(ref net) => self.format_escaped_tag(net),
         };
         true
     }
@@ -408,18 +422,35 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
     }
 
     fn format_list(&mut self, node: &'a AstNode<'a>, entering: bool) {
-        if !entering
-            && match node.next_sibling() {
+        let ol_start = match node.data.borrow().value {
+            NodeValue::List(NodeList {
+                list_type: ListType::Ordered,
+                start,
+                ..
+            }) => Some(start),
+            _ => None,
+        };
+
+        if entering {
+            if let Some(start) = ol_start {
+                self.ol_stack.push(start);
+            }
+        } else {
+            if ol_start.is_some() {
+                self.ol_stack.pop();
+            }
+
+            if match node.next_sibling() {
                 Some(next_sibling) => matches!(
                     next_sibling.data.borrow().value,
                     NodeValue::CodeBlock(..) | NodeValue::List(..)
                 ),
                 _ => false,
+            } {
+                self.cr();
+                write!(self, "<!-- end list -->").unwrap();
+                self.blankline();
             }
-        {
-            self.cr();
-            write!(self, "<!-- end list -->").unwrap();
-            self.blankline();
         }
     }
 
@@ -434,24 +465,38 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
         let marker_width = if parent.list_type == ListType::Bullet {
             2
         } else {
-            let list_number = match node.data.borrow().value {
-                NodeValue::Item(ref ni) => ni.start,
-                NodeValue::TaskItem(_) => parent.start,
-                _ => unreachable!(),
+            let list_number = if let Some(last_stack) = self.ol_stack.last_mut() {
+                let list_number = *last_stack;
+                if entering {
+                    *last_stack += 1;
+                };
+                list_number
+            } else {
+                match node.data.borrow().value {
+                    NodeValue::Item(ref ni) => ni.start,
+                    NodeValue::TaskItem(_) => parent.start,
+                    _ => unreachable!(),
+                }
             };
             let list_delim = parent.delimiter;
             write!(
                 listmarker,
-                "{}{}{}",
+                "{}{} ",
                 list_number,
                 if list_delim == ListDelimType::Paren {
                     ")"
                 } else {
                     "."
-                },
-                if list_number < 10 { "  " } else { " " }
+                }
             )
             .unwrap();
+            let mut current_len = listmarker.len();
+
+            while current_len < self.options.render.ol_width {
+                write!(listmarker, " ").unwrap();
+                current_len += 1;
+            }
+
             listmarker.len()
         };
 
@@ -467,7 +512,11 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
                 write!(self.prefix, " ").unwrap();
             }
         } else {
-            let new_len = self.prefix.len() - marker_width;
+            let new_len = if self.prefix.len() > marker_width {
+                self.prefix.len() - marker_width
+            } else {
+                0
+            };
             self.prefix.truncate(new_len);
             self.cr();
         }
@@ -513,12 +562,13 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
             let info = ncb.info.as_bytes();
             let literal = ncb.literal.as_bytes();
 
-            if info.is_empty()
-                && (literal.len() > 2
-                    && !isspace(literal[0])
-                    && !(isspace(literal[literal.len() - 1])
-                        && isspace(literal[literal.len() - 2])))
-                && !first_in_list_item
+            #[allow(clippy::len_zero)]
+            if !(info.len() > 0
+                || literal.len() <= 2
+                || isspace(literal[0])
+                || first_in_list_item
+                || self.options.render.prefer_fenced
+                || isspace(literal[literal.len() - 1]) && isspace(literal[literal.len() - 2]))
             {
                 write!(self, "    ").unwrap();
                 write!(self.prefix, "    ").unwrap();
@@ -594,6 +644,8 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
                 && !self.options.render.hardbreaks
             {
                 self.cr();
+            } else if self.options.render.hardbreaks {
+                self.output(&[b'\n'], allow_wrap, Escaping::Literal);
             } else {
                 self.output(&[b' '], allow_wrap, Escaping::Literal);
             }
@@ -667,6 +719,18 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
         write!(self, "^").unwrap();
     }
 
+    fn format_underline(&mut self) {
+        write!(self, "__").unwrap();
+    }
+
+    fn format_spoiler(&mut self) {
+        write!(self, "||").unwrap();
+    }
+
+    fn format_escaped_tag(&mut self, net: &String) {
+        self.output(net.as_bytes(), false, Escaping::Literal);
+    }
+
     fn format_link(&mut self, node: &'a AstNode<'a>, nl: &NodeLink, entering: bool) -> bool {
         if is_autolink(node, nl) {
             if entering {
@@ -684,6 +748,24 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
                 write!(self, "\"").unwrap();
             }
             write!(self, ")").unwrap();
+        }
+
+        true
+    }
+
+    fn format_wikilink(&mut self, nl: &NodeWikiLink, entering: bool) -> bool {
+        if entering {
+            write!(self, "[[").unwrap();
+            if self.options.extension.wikilinks_title_after_pipe {
+                self.output(nl.url.as_bytes(), false, Escaping::Url);
+                write!(self, "|").unwrap();
+            }
+        } else {
+            if self.options.extension.wikilinks_title_before_pipe {
+                write!(self, "|").unwrap();
+                self.output(nl.url.as_bytes(), false, Escaping::Url);
+            }
+            write!(self, "]]").unwrap();
         }
 
         true
@@ -708,7 +790,7 @@ impl<'a, 'o> CommonMarkFormatter<'a, 'o> {
     fn format_shortcode(&mut self, ne: &NodeShortCode, entering: bool) {
         if entering {
             write!(self, ":").unwrap();
-            self.output(ne.shortcode().as_bytes(), false, Escaping::Literal);
+            self.output(ne.code.as_bytes(), false, Escaping::Literal);
             write!(self, ":").unwrap();
         }
     }

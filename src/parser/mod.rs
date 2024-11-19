@@ -16,15 +16,17 @@ use crate::nodes::{
     Ast, AstNode, ListDelimType, ListType, NodeCodeBlock, NodeDescriptionItem, NodeHeading,
     NodeHtmlBlock, NodeList, NodeValue,
 };
-use crate::scanners;
+use crate::scanners::{self, SetextChar};
 use crate::strings::{self, split_off_front_matter, Case};
-use derive_builder::Builder;
+use bon::Builder;
 use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
+use std::fmt::{self, Debug, Formatter};
 use std::mem;
+use std::panic::RefUnwindSafe;
 use std::str;
+use std::sync::Arc;
 use typed_arena::Arena;
 
 use crate::adapters::HeadingAdapter;
@@ -58,55 +60,6 @@ pub fn parse_document<'a>(
     buffer: &str,
     options: &Options,
 ) -> &'a AstNode<'a> {
-    parse_document_with_broken_link_callback(arena, buffer, options, None)
-}
-
-/// Parse a Markdown document to an AST.
-///
-/// In case the parser encounters any potential links that have a broken reference (e.g `[foo]`
-/// when there is no `[foo]: url` entry at the bottom) the provided callback will be called with
-/// the reference name, and the returned pair will be used as the link destination and title if not
-/// None.
-///
-/// **Note:** The label provided to the callback is the normalized representation of the label as
-/// described in the [GFM spec](https://github.github.com/gfm/#matches).
-///
-/// ```
-/// use comrak::{Arena, parse_document_with_broken_link_callback, format_html, Options};
-/// use comrak::nodes::{AstNode, NodeValue};
-///
-/// # fn main() -> std::io::Result<()> {
-/// // The returned nodes are created in the supplied Arena, and are bound by its lifetime.
-/// let arena = Arena::new();
-///
-/// let root = parse_document_with_broken_link_callback(
-///     &arena,
-///     "# Cool input!\nWow look at this cool [link][foo]. A [broken link] renders as text.",
-///     &Options::default(),
-///     Some(&mut |link_ref: &str| match link_ref {
-///         "foo" => Some((
-///             "https://www.rust-lang.org/".to_string(),
-///             "The Rust Language".to_string(),
-///         )),
-///         _ => None,
-///     }),
-/// );
-///
-/// let mut output = Vec::new();
-/// format_html(root, &Options::default(), &mut output)?;
-/// let output_str = std::str::from_utf8(&output).expect("invalid UTF-8");
-/// assert_eq!(output_str, "<h1>Cool input!</h1>\n<p>Wow look at this cool \
-///                 <a href=\"https://www.rust-lang.org/\" title=\"The Rust Language\">link</a>. \
-///                 A [broken link] renders as text.</p>\n");
-/// # Ok(())
-/// # }
-/// ```
-pub fn parse_document_with_broken_link_callback<'a, 'c>(
-    arena: &'a Arena<AstNode<'a>>,
-    buffer: &str,
-    options: &Options,
-    callback: Option<Callback<'c>>,
-) -> &'a AstNode<'a> {
     let root: &'a AstNode<'a> = arena.alloc(Node::new(RefCell::new(Ast {
         value: NodeValue::Document,
         content: String::new(),
@@ -115,16 +68,73 @@ pub fn parse_document_with_broken_link_callback<'a, 'c>(
         open: true,
         last_line_blank: false,
         table_visited: false,
+        line_offsets: Vec::with_capacity(0),
     })));
-    let mut parser = Parser::new(arena, root, options, callback);
+    let mut parser = Parser::new(arena, root, options);
     let mut linebuf = Vec::with_capacity(buffer.len());
     parser.feed(&mut linebuf, buffer, true);
     parser.finish(linebuf)
 }
 
-type Callback<'c> = &'c mut dyn FnMut(&str) -> Option<(String, String)>;
+/// Parse a Markdown document to an AST, specifying
+/// [`ParseOptions::broken_link_callback`].
+#[deprecated(
+    since = "0.25.0",
+    note = "The broken link callback has been moved into ParseOptions."
+)]
+pub fn parse_document_with_broken_link_callback<'a>(
+    arena: &'a Arena<AstNode<'a>>,
+    buffer: &str,
+    options: &Options,
+    callback: Arc<dyn BrokenLinkCallback>,
+) -> &'a AstNode<'a> {
+    let mut options_with_callback = options.clone();
+    options_with_callback.parse.broken_link_callback = Some(callback);
+    parse_document(arena, buffer, &options_with_callback)
+}
 
-pub struct Parser<'a, 'o, 'c> {
+/// The type of the callback used when a reference link is encountered with no
+/// matching reference.
+///
+/// The details of the broken reference are passed in the
+/// [`BrokenLinkReference`] argument. If a [`ResolvedReference`] is returned, it
+/// is used as the link; otherwise, no link is made and the reference text is
+/// preserved in its entirety.
+pub trait BrokenLinkCallback: RefUnwindSafe + Send + Sync {
+    /// Potentially resolve a single broken link reference.
+    fn resolve(&self, broken_link_reference: BrokenLinkReference) -> Option<ResolvedReference>;
+}
+
+impl Debug for dyn BrokenLinkCallback {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        formatter.write_str("<dyn BrokenLinkCallback>")
+    }
+}
+
+impl<F> BrokenLinkCallback for F
+where
+    F: Fn(BrokenLinkReference) -> Option<ResolvedReference>,
+    F: RefUnwindSafe + Send + Sync,
+{
+    fn resolve(&self, broken_link_reference: BrokenLinkReference) -> Option<ResolvedReference> {
+        self(broken_link_reference)
+    }
+}
+
+/// Struct to the broken link callback, containing details on the link reference
+/// which failed to find a match.
+#[derive(Debug)]
+pub struct BrokenLinkReference<'l> {
+    /// The normalized reference link label. Unicode case folding is applied;
+    /// see <https://github.com/commonmark/commonmark-spec/issues/695> for a
+    /// discussion on the details of what this exactly means.
+    pub normalized: &'l str,
+
+    /// The original text in the link label.
+    pub original: &'l str,
+}
+
+pub struct Parser<'a, 'o> {
     arena: &'a Arena<AstNode<'a>>,
     refmap: RefMap,
     root: &'a AstNode<'a>,
@@ -144,7 +154,6 @@ pub struct Parser<'a, 'o, 'c> {
     last_buffer_ended_with_cr: bool,
     total_size: usize,
     options: &'o Options,
-    callback: Option<Callback<'c>>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -161,9 +170,30 @@ pub struct Options {
     pub render: RenderOptions,
 }
 
+/// Trait for link and image URL rewrite extensions.
+pub trait URLRewriter: RefUnwindSafe + Send + Sync {
+    /// Converts the given URL from Markdown to its representation when output as HTML.
+    fn to_html(&self, url: &str) -> String;
+}
+
+impl Debug for dyn URLRewriter {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        formatter.write_str("<dyn URLRewriter>")
+    }
+}
+
+impl<F> URLRewriter for F
+where
+    F: for<'a> Fn(&'a str) -> String,
+    F: RefUnwindSafe + Send + Sync,
+{
+    fn to_html(&self, url: &str) -> String {
+        self(url)
+    }
+}
+
 #[non_exhaustive]
 #[derive(Default, Debug, Clone, Builder)]
-#[builder(default)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Options to select extensions.
 pub struct ExtensionOptions {
@@ -178,6 +208,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("Hello ~world~ there.\n", &options),
     ///            "<p>Hello <del>world</del> there.</p>\n");
     /// ```
+    #[builder(default)]
     pub strikethrough: bool,
 
     /// Enables the
@@ -192,6 +223,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("Hello <xmp>.\n\n<xmp>", &options),
     ///            "<p>Hello &lt;xmp>.</p>\n&lt;xmp>\n");
     /// ```
+    #[builder(default)]
     pub tagfilter: bool,
 
     /// Enables the [table extension](https://github.github.com/gfm/#tables-extension-)
@@ -205,6 +237,7 @@ pub struct ExtensionOptions {
     ///            "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n\
     ///             <tbody>\n<tr>\n<td>c</td>\n<td>d</td>\n</tr>\n</tbody>\n</table>\n");
     /// ```
+    #[builder(default)]
     pub table: bool,
 
     /// Enables the [autolink extension](https://github.github.com/gfm/#autolinks-extension-)
@@ -217,6 +250,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("Hello www.github.com.\n", &options),
     ///            "<p>Hello <a href=\"http://www.github.com\">www.github.com</a>.</p>\n");
     /// ```
+    #[builder(default)]
     pub autolink: bool,
 
     /// Enables the
@@ -235,6 +269,7 @@ pub struct ExtensionOptions {
     ///            "<ul>\n<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> Done</li>\n\
     ///            <li><input type=\"checkbox\" disabled=\"\" /> Not done</li>\n</ul>\n");
     /// ```
+    #[builder(default)]
     pub tasklist: bool,
 
     /// Enables the superscript Comrak extension.
@@ -246,6 +281,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("e = mc^2^.\n", &options),
     ///            "<p>e = mc<sup>2</sup>.</p>\n");
     /// ```
+    #[builder(default)]
     pub superscript: bool,
 
     /// Enables the header IDs Comrak extension.
@@ -271,6 +307,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("Hi[^x].\n\n[^x]: A greeting.\n", &options),
     ///            "<p>Hi<sup class=\"footnote-ref\"><a href=\"#fn-x\" id=\"fnref-x\" data-footnote-ref>1</a></sup>.</p>\n<section class=\"footnotes\" data-footnotes>\n<ol>\n<li id=\"fn-x\">\n<p>A greeting. <a href=\"#fnref-x\" class=\"footnote-backref\" data-footnote-backref data-footnote-backref-idx=\"1\" aria-label=\"Back to reference 1\">↩</a></p>\n</li>\n</ol>\n</section>\n");
     /// ```
+    #[builder(default)]
     pub footnotes: bool,
 
     /// Enables the description lists extension.
@@ -299,6 +336,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("Term\n\n: Definition", &options),
     ///            "<dl><dt>Term</dt>\n<dd>\n<p>Definition</p>\n</dd>\n</dl>\n");
     /// ```
+    #[builder(default)]
     pub description_lists: bool,
 
     /// Enables the front matter extension.
@@ -364,6 +402,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html(">>>\nparagraph\n>>>", &options),
     ///            "<blockquote>\n<p>paragraph</p>\n</blockquote>\n");
     /// ```
+    #[builder(default)]
     pub multiline_block_quotes: bool,
 
     /// Enables math using dollar syntax.
@@ -385,6 +424,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("$$\nx^2\n$$\n", &options),
     ///            "<p><span data-math-style=\"display\">\nx^2\n</span></p>\n");
     /// ```
+    #[builder(default)]
     pub math_dollars: bool,
 
     /// Enables math using code syntax.
@@ -406,6 +446,7 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("```math\nx^2\n```\n", &options),
     ///            "<pre><code class=\"language-math\" data-math-style=\"display\">x^2\n</code></pre>\n");
     /// ```
+    #[builder(default)]
     pub math_code: bool,
 
     #[cfg(feature = "shortcodes")]
@@ -422,12 +463,142 @@ pub struct ExtensionOptions {
     /// assert_eq!(markdown_to_html("Happy Friday! :smile:", &options),
     ///            "<p>Happy Friday! 😄</p>\n");
     /// ```
+    #[builder(default)]
     pub shortcodes: bool,
+
+    /// Enables wikilinks using title after pipe syntax
+    ///
+    /// ```` md
+    /// [[url|link label]]
+    /// ````
+    ///
+    /// ```
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.extension.wikilinks_title_after_pipe = true;
+    /// assert_eq!(markdown_to_html("[[url|link label]]", &options),
+    ///            "<p><a href=\"url\" data-wikilink=\"true\">link label</a></p>\n");
+    /// ```
+    #[builder(default)]
+    pub wikilinks_title_after_pipe: bool,
+
+    /// Enables wikilinks using title before pipe syntax
+    ///
+    /// ```` md
+    /// [[link label|url]]
+    /// ````
+    ///
+    /// ```
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.extension.wikilinks_title_before_pipe = true;
+    /// assert_eq!(markdown_to_html("[[link label|url]]", &options),
+    ///            "<p><a href=\"url\" data-wikilink=\"true\">link label</a></p>\n");
+    /// ```
+    #[builder(default)]
+    pub wikilinks_title_before_pipe: bool,
+
+    /// Enables underlines using double underscores
+    ///
+    /// ```md
+    /// __underlined text__
+    /// ```
+    ///
+    /// ```
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.extension.underline = true;
+    ///
+    /// assert_eq!(markdown_to_html("__underlined text__", &options),
+    ///            "<p><u>underlined text</u></p>\n");
+    /// ```
+    #[builder(default)]
+    pub underline: bool,
+
+    /// Enables spoilers using double vertical bars
+    ///
+    /// ```md
+    /// Darth Vader is ||Luke's father||
+    /// ```
+    ///
+    /// ```
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.extension.spoiler = true;
+    ///
+    /// assert_eq!(markdown_to_html("Darth Vader is ||Luke's father||", &options),
+    ///            "<p>Darth Vader is <span class=\"spoiler\">Luke's father</span></p>\n");
+    /// ```
+    #[builder(default)]
+    pub spoiler: bool,
+
+    /// Requires at least one space after a `>` character to generate a blockquote,
+    /// and restarts blockquote nesting across unique lines of input
+    ///
+    /// ```md
+    /// >implying implications
+    ///
+    /// > one
+    /// > > two
+    /// > three
+    /// ```
+    ///
+    /// ```
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.extension.greentext = true;
+    ///
+    /// assert_eq!(markdown_to_html(">implying implications", &options),
+    ///            "<p>&gt;implying implications</p>\n");
+    ///
+    /// assert_eq!(markdown_to_html("> one\n> > two\n> three", &options),
+    ///            concat!(
+    ///             "<blockquote>\n",
+    ///             "<p>one</p>\n",
+    ///             "<blockquote>\n<p>two</p>\n</blockquote>\n",
+    ///             "<p>three</p>\n",
+    ///             "</blockquote>\n"));
+    /// ```
+    #[builder(default)]
+    pub greentext: bool,
+
+    /// Wraps embedded image URLs using a function or custom trait object.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use comrak::{markdown_to_html, ComrakOptions};
+    /// let mut options = ComrakOptions::default();
+    ///
+    /// options.extension.image_url_rewriter = Some(Arc::new(
+    ///     |url: &str| format!("https://safe.example.com?url={}", url)
+    /// ));
+    ///
+    /// assert_eq!(markdown_to_html("![](http://unsafe.example.com/bad.png)", &options),
+    ///            "<p><img src=\"https://safe.example.com?url=http://unsafe.example.com/bad.png\" alt=\"\" /></p>\n");
+    /// ```
+    #[cfg_attr(feature = "arbitrary", arbitrary(value = None))]
+    pub image_url_rewriter: Option<Arc<dyn URLRewriter>>,
+
+    /// Wraps link URLs using a function or custom trait object.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use comrak::{markdown_to_html, ComrakOptions};
+    /// let mut options = ComrakOptions::default();
+    ///
+    /// options.extension.link_url_rewriter = Some(Arc::new(
+    ///     |url: &str| format!("https://safe.example.com/norefer?url={}", url)
+    /// ));
+    ///
+    /// assert_eq!(markdown_to_html("[my link](http://unsafe.example.com/bad)", &options),
+    ///            "<p><a href=\"https://safe.example.com/norefer?url=http://unsafe.example.com/bad\">my link</a></p>\n");
+    /// ```
+    #[cfg_attr(feature = "arbitrary", arbitrary(value = None))]
+    pub link_url_rewriter: Option<Arc<dyn URLRewriter>>,
 }
 
 #[non_exhaustive]
-#[derive(Default, Debug, Clone, Builder)]
-#[builder(default)]
+#[derive(Default, Clone, Debug, Builder)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Options for parser functions.
 pub struct ParseOptions {
@@ -443,6 +614,7 @@ pub struct ParseOptions {
     /// assert_eq!(markdown_to_html("'Hello,' \"world\" ...", &options),
     ///            "<p>‘Hello,’ “world” …</p>\n");
     /// ```
+    #[builder(default)]
     pub smart: bool,
 
     /// The default info string for fenced code blocks.
@@ -460,10 +632,12 @@ pub struct ParseOptions {
     pub default_info_string: Option<String>,
 
     /// Whether or not a simple `x` or `X` is used for tasklist or any other symbol is allowed.
+    #[builder(default)]
     pub relaxed_tasklist_matching: bool,
 
     /// Relax parsing of autolinks, allow links to be detected inside brackets
-    /// and allow all url schemes
+    /// and allow all url schemes. It is intended to allow a very specific type of autolink
+    /// detection, such as `[this http://and.com that]` or `{http://foo.com}`, on a best can basis.
     ///
     /// ```
     /// # use comrak::{markdown_to_html, Options};
@@ -476,12 +650,44 @@ pub struct ParseOptions {
     /// assert_eq!(markdown_to_html("[https://foo.com]", &options),
     ///            "<p>[<a href=\"https://foo.com\">https://foo.com</a>]</p>\n");
     /// ```
+    #[builder(default)]
     pub relaxed_autolinks: bool,
+
+    /// In case the parser encounters any potential links that have a broken
+    /// reference (e.g `[foo]` when there is no `[foo]: url` entry at the
+    /// bottom) the provided callback will be called with the reference name,
+    /// both in normalized form and unmodified, and the returned pair will be
+    /// used as the link destination and title if not [`None`].
+    ///
+    /// ```
+    /// # use std::{str, sync::Arc};
+    /// # use comrak::{markdown_to_html, BrokenLinkReference, Options, ResolvedReference};
+    /// let cb = |link_ref: BrokenLinkReference| match link_ref.normalized {
+    ///     "foo" => Some(ResolvedReference {
+    ///         url: "https://www.rust-lang.org/".to_string(),
+    ///         title: "The Rust Language".to_string(),
+    ///     }),
+    ///     _ => None,
+    /// };
+    ///
+    /// let mut options = Options::default();
+    /// options.parse.broken_link_callback = Some(Arc::new(cb));
+    ///
+    /// let output = markdown_to_html(
+    ///     "# Cool input!\nWow look at this cool [link][foo]. A [broken link] renders as text.",
+    ///     &options,
+    /// );
+    ///
+    /// assert_eq!(output,
+    ///            "<h1>Cool input!</h1>\n<p>Wow look at this cool \
+    ///            <a href=\"https://www.rust-lang.org/\" title=\"The Rust Language\">link</a>. \
+    ///            A [broken link] renders as text.</p>\n");
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    pub broken_link_callback: Option<Arc<dyn BrokenLinkCallback>>,
 }
 
 #[non_exhaustive]
 #[derive(Default, Debug, Clone, Copy, Builder)]
-#[builder(default)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Options for formatter functions.
 pub struct RenderOptions {
@@ -498,6 +704,7 @@ pub struct RenderOptions {
     /// assert_eq!(markdown_to_html("Hello.\nWorld.\n", &options),
     ///            "<p>Hello.<br />\nWorld.</p>\n");
     /// ```
+    #[builder(default)]
     pub hardbreaks: bool,
 
     /// GitHub-style `<pre lang="xyz">` is used for fenced code blocks with info tags.
@@ -512,6 +719,7 @@ pub struct RenderOptions {
     /// assert_eq!(markdown_to_html("``` rust\nfn hello();\n```\n", &options),
     ///            "<pre lang=\"rust\"><code>fn hello();\n</code></pre>\n");
     /// ```
+    #[builder(default)]
     pub github_pre_lang: bool,
 
     /// Enable full info strings for code blocks
@@ -527,6 +735,7 @@ pub struct RenderOptions {
     /// let re = regex::Regex::new(r#"data-meta="extra info""#).unwrap();
     /// assert!(re.is_match(&html));
     /// ```
+    #[builder(default)]
     pub full_info_string: bool,
 
     /// The wrap column when outputting CommonMark.
@@ -549,6 +758,7 @@ pub struct RenderOptions {
     ///            "hello hello hello\nhello hello hello\n");
     /// # }
     /// ```
+    #[builder(default)]
     pub width: usize,
 
     /// Allow rendering of raw HTML and potentially dangerous links.
@@ -574,6 +784,7 @@ pub struct RenderOptions {
     ///             <p><a href=\"javascript:alert(document.cookie)\">Dangerous</a>.</p>\n\
     ///             <p><a href=\"http://commonmark.org\">Safe</a>.</p>\n");
     /// ```
+    #[builder(default)]
     pub unsafe_: bool,
 
     /// Escape raw HTML instead of clobbering it.
@@ -589,13 +800,14 @@ pub struct RenderOptions {
     /// assert_eq!(markdown_to_html(input, &options),
     ///            "<p>&lt;i&gt;italic text&lt;/i&gt;</p>\n");
     /// ```
+    #[builder(default)]
     pub escape: bool,
 
     /// Set the type of [bullet list marker](https://spec.commonmark.org/0.30/#bullet-list-marker) to use. Options are:
     ///
-    /// * `ListStyleType::Dash` to use `-` (default)
-    /// * `ListStyleType::Plus` to use `+`
-    /// * `ListStyleType::Star` to use `*`
+    /// * [`ListStyleType::Dash`] to use `-` (default)
+    /// * [`ListStyleType::Plus`] to use `+`
+    /// * [`ListStyleType::Star`] to use `*`
     ///
     /// ```rust
     /// # use comrak::{markdown_to_commonmark, Options, ListStyleType};
@@ -612,21 +824,45 @@ pub struct RenderOptions {
     /// assert_eq!(markdown_to_commonmark(input, &options),
     ///            "* one\n* two\n* three\n");
     /// ```
+    #[builder(default)]
     pub list_style: ListStyleType,
 
-    /// Include source position attributes in XML output.
+    /// Include source position attributes in HTML and XML output.
     ///
-    /// Not yet compatible with extension.description_lists.
+    /// Sourcepos information is reliable for all core block items, and most
+    /// extensions. The description lists extension still has issues; see
+    /// <https://github.com/kivikakk/comrak/blob/3bb6d4ce/src/tests/description_lists.rs#L60-L125>.
+    ///
+    /// Sourcepos information is **not** reliable for inlines, and is not
+    /// included in HTML without also setting [`experimental_inline_sourcepos`].
+    /// See <https://github.com/kivikakk/comrak/pull/439> for a discussion.
     ///
     /// ```rust
     /// # use comrak::{markdown_to_commonmark_xml, Options};
     /// let mut options = Options::default();
     /// options.render.sourcepos = true;
-    /// let input = "Hello *world*!";
+    /// let input = "## Hello world!";
     /// let xml = markdown_to_commonmark_xml(input, &options);
-    /// assert!(xml.contains("<emph sourcepos=\"1:7-1:13\">"));
+    /// assert!(xml.contains("<text sourcepos=\"1:4-1:15\" xml:space=\"preserve\">"));
     /// ```
+    #[builder(default)]
     pub sourcepos: bool,
+
+    /// Include inline sourcepos in HTML output, which is known to have issues.
+    /// See <https://github.com/kivikakk/comrak/pull/439> for a discussion.
+    /// ```rust
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.render.sourcepos = true;
+    /// let input = "Hello *world*!";
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p data-sourcepos=\"1:1-1:14\">Hello <em>world</em>!</p>\n");
+    /// options.render.experimental_inline_sourcepos = true;
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p data-sourcepos=\"1:1-1:14\">Hello <em data-sourcepos=\"1:7-1:13\">world</em>!</p>\n");
+    /// ```
+    #[builder(default)]
+    pub experimental_inline_sourcepos: bool,
 
     /// Wrap escaped characters in a `<span>` to allow any
     /// post-processing to recognize them.
@@ -643,21 +879,146 @@ pub struct RenderOptions {
     /// assert_eq!(markdown_to_html(input, &options),
     ///            "<p>Notify user <span data-escaped-char>@</span>example</p>\n");
     /// ```
+    #[builder(default)]
     pub escaped_char_spans: bool,
+
+    /// Ignore setext headings in input.
+    ///
+    /// ```rust
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// let input = "setext heading\n---";
+    ///
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<h2>setext heading</h2>\n");
+    ///
+    /// options.render.ignore_setext = true;
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p>setext heading</p>\n<hr />\n");
+    /// ```
+    #[builder(default)]
+    pub ignore_setext: bool,
+
+    /// Ignore empty links in input.
+    ///
+    /// ```rust
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// let input = "[]()";
+    ///
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p><a href=\"\"></a></p>\n");
+    ///
+    /// options.render.ignore_empty_links = true;
+    /// assert_eq!(markdown_to_html(input, &options), "<p>[]()</p>\n");
+    /// ```
+    #[builder(default)]
+    pub ignore_empty_links: bool,
+
+    /// Enables GFM quirks in HTML output which break CommonMark compatibility.
+    ///
+    /// ```rust
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// let input = "****abcd**** *_foo_*";
+    ///
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p><strong><strong>abcd</strong></strong> <em><em>foo</em></em></p>\n");
+    ///
+    /// options.render.gfm_quirks = true;
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p><strong>abcd</strong> <em><em>foo</em></em></p>\n");
+    /// ```
+    #[builder(default)]
+    pub gfm_quirks: bool,
+
+    /// Prefer fenced code blocks when outputting CommonMark.
+    ///
+    /// ```rust
+    /// # use std::str;
+    /// # use comrak::{Arena, Options, format_commonmark, parse_document};
+    /// let arena = Arena::new();
+    /// let mut options = Options::default();
+    /// let input = "```\nhello\n```\n";
+    /// let root = parse_document(&arena, input, &options);
+    ///
+    /// let mut buf = Vec::new();
+    /// format_commonmark(&root, &options, &mut buf);
+    /// assert_eq!(str::from_utf8(&buf).unwrap(), "    hello\n");
+    ///
+    /// buf.clear();
+    /// options.render.prefer_fenced = true;
+    /// format_commonmark(&root, &options, &mut buf);
+    /// assert_eq!(str::from_utf8(&buf).unwrap(), "```\nhello\n```\n");
+    /// ```
+    #[builder(default)]
+    pub prefer_fenced: bool,
+
+    /// Render the image as a figure element with the title as its caption.
+    ///
+    /// ```rust
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// let input = "![image](https://example.com/image.png \"this is an image\")";
+    ///
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p><img src=\"https://example.com/image.png\" alt=\"image\" title=\"this is an image\" /></p>\n");
+    ///
+    /// options.render.figure_with_caption = true;
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<p><figure><img src=\"https://example.com/image.png\" alt=\"image\" title=\"this is an image\" /><figcaption>this is an image</figcaption></figure></p>\n");
+    /// ```
+    #[builder(default)]
+    pub figure_with_caption: bool,
+
+    /// Add classes to the output of the tasklist extension. This allows tasklists to be styled.
+    ///
+    /// ```rust
+    /// # use comrak::{markdown_to_html, Options};
+    /// let mut options = Options::default();
+    /// options.extension.tasklist = true;
+    /// let input = "- [ ] Foo";
+    ///
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<ul>\n<li><input type=\"checkbox\" disabled=\"\" /> Foo</li>\n</ul>\n");
+    ///
+    /// options.render.tasklist_classes = true;
+    /// assert_eq!(markdown_to_html(input, &options),
+    ///            "<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" disabled=\"\" /> Foo</li>\n</ul>\n");
+    /// ```
+    #[builder(default)]
+    pub tasklist_classes: bool,
+
+    /// Render ordered list with a minimum marker width.
+    /// Having a width lower than 3 doesn't do anything.
+    ///
+    /// ```rust
+    /// # use comrak::{markdown_to_commonmark, Options};
+    /// let mut options = Options::default();
+    /// let input = "1. Something";
+    ///
+    /// assert_eq!(markdown_to_commonmark(input, &options),
+    ///            "1. Something\n");
+    ///
+    /// options.render.ol_width = 5;
+    /// assert_eq!(markdown_to_commonmark(input, &options),
+    ///            "1.   Something\n");
+    /// ```
+    #[builder(default)]
+    pub ol_width: usize,
 }
 
 #[non_exhaustive]
 #[derive(Default, Debug, Clone, Builder)]
-#[builder(default)]
 /// Umbrella plugins struct.
 pub struct Plugins<'p> {
     /// Configure render-time plugins.
+    #[builder(default)]
     pub render: RenderPlugins<'p>,
 }
 
 #[non_exhaustive]
 #[derive(Default, Clone, Builder)]
-#[builder(default)]
 /// Plugins for alternative rendering.
 pub struct RenderPlugins<'p> {
     /// Provide a syntax highlighter adapter implementation for syntax
@@ -712,9 +1073,13 @@ impl Debug for RenderPlugins<'_> {
     }
 }
 
-#[derive(Clone)]
-pub struct Reference {
+/// A reference link's resolved details.
+#[derive(Clone, Debug)]
+pub struct ResolvedReference {
+    /// The destination URL of the reference link.
     pub url: String,
+
+    /// The text of the link.
     pub title: String,
 }
 
@@ -725,13 +1090,8 @@ struct FootnoteDefinition<'a> {
     total_references: u32,
 }
 
-impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
-    fn new(
-        arena: &'a Arena<AstNode<'a>>,
-        root: &'a AstNode<'a>,
-        options: &'o Options,
-        callback: Option<Callback<'c>>,
-    ) -> Self {
+impl<'a, 'o> Parser<'a, 'o> {
+    fn new(arena: &'a Arena<AstNode<'a>>, root: &'a AstNode<'a>, options: &'o Options) -> Self {
         Parser {
             arena,
             refmap: RefMap::new(),
@@ -752,7 +1112,6 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             last_buffer_ended_with_cr: false,
             total_size: 0,
             options,
-            callback,
         }
     }
 
@@ -1039,7 +1398,8 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
                     }
                 }
                 NodeValue::Table(..) => {
-                    if !table::matches(&line[self.first_nonspace..]) {
+                    if !table::matches(&line[self.first_nonspace..], self.options.extension.spoiler)
+                    {
                         return (false, container, should_continue);
                     }
                     continue;
@@ -1067,6 +1427,17 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
         }
 
         (true, container, should_continue)
+    }
+
+    fn is_not_greentext(&mut self, line: &[u8]) -> bool {
+        !self.options.extension.greentext || strings::is_space_or_tab(line[self.first_nonspace + 1])
+    }
+
+    fn setext_heading_line(&mut self, s: &[u8]) -> Option<SetextChar> {
+        match self.options.render.ignore_setext {
+            false => scanners::setext_heading_line(s),
+            true => None,
+        }
     }
 
     fn open_new_blocks(&mut self, container: &mut &'a AstNode<'a>, line: &[u8], all_matched: bool) {
@@ -1103,7 +1474,8 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
                     self.first_nonspace + 1,
                 );
                 self.advance_offset(line, first_nonspace + matched - offset, false);
-            } else if !indented && line[self.first_nonspace] == b'>' {
+            } else if !indented && line[self.first_nonspace] == b'>' && self.is_not_greentext(line)
+            {
                 let blockquote_startpos = self.first_nonspace;
 
                 let offset = self.first_nonspace + 1 - self.offset;
@@ -1190,7 +1562,7 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             } else if !indented
                 && node_matches!(container, NodeValue::Paragraph)
                 && unwrap_into(
-                    scanners::setext_heading_line(&line[self.first_nonspace..]),
+                    self.setext_heading_line(&line[self.first_nonspace..]),
                     &mut sc,
                 )
             {
@@ -1373,7 +1745,7 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
 
     fn parse_block_quote_prefix(&mut self, line: &[u8]) -> bool {
         let indent = self.indent;
-        if indent <= 3 && line[self.first_nonspace] == b'>' {
+        if indent <= 3 && line[self.first_nonspace] == b'>' && self.is_not_greentext(line) {
             self.advance_offset(line, indent + 1, true);
 
             if strings::is_space_or_tab(line[self.offset]) {
@@ -1660,6 +2032,11 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
         if !self.current.same_node(last_matched_container)
             && container.same_node(last_matched_container)
             && !self.blank
+            && (!self.options.extension.greentext
+                || !matches!(
+                    container.data.borrow().value,
+                    NodeValue::BlockQuote | NodeValue::Document
+                ))
             && node_matches!(self.current, NodeValue::Paragraph)
         {
             self.add_line(self.current, line);
@@ -1752,6 +2129,11 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             }
         }
         if self.offset < line.len() {
+            // since whitespace is stripped off the beginning of lines, we need to keep
+            // track of how much was stripped off. This allows us to properly calculate
+            // inline sourcepos during inline processing.
+            ast.line_offsets.push(self.offset);
+
             ast.content
                 .push_str(str::from_utf8(&line[self.offset..]).unwrap());
         }
@@ -1939,10 +2321,8 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             self.options,
             content,
             node_data.sourcepos.start.line,
-            node_data.sourcepos.start.column - 1 + node_data.internal_offset,
             &mut self.refmap,
             &delimiter_arena,
-            self.callback.as_mut(),
         );
 
         while subj.parse_inline(node) {}
@@ -1991,7 +2371,7 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
         match node.data.borrow().value {
             NodeValue::FootnoteDefinition(ref nfd) => {
                 map.insert(
-                    strings::normalize_label(&nfd.name, Case::DontPreserve),
+                    strings::normalize_label(&nfd.name, Case::Fold),
                     FootnoteDefinition {
                         ix: None,
                         node,
@@ -2017,7 +2397,7 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
         let mut replace = None;
         match ast.value {
             NodeValue::FootnoteReference(ref mut nfr) => {
-                let normalized = strings::normalize_label(&nfr.name, Case::DontPreserve);
+                let normalized = strings::normalize_label(&nfr.name, Case::Fold);
                 if let Some(ref mut footnote) = map.get_mut(&normalized) {
                     let ix = match footnote.ix {
                         Some(ix) => ix,
@@ -2100,7 +2480,7 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
                                 }
                             }
                         }
-                        NodeValue::Link(..) | NodeValue::Image(..) => {
+                        NodeValue::Link(..) | NodeValue::Image(..) | NodeValue::WikiLink(..) => {
                             this_bracket = true;
                             break;
                         }
@@ -2169,7 +2549,13 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             return;
         }
 
-        if !node_matches!(parent.parent().unwrap(), NodeValue::Item(..)) {
+        let grandparent = parent.parent().unwrap();
+        if !node_matches!(grandparent, NodeValue::Item(..)) {
+            return;
+        }
+
+        let great_grandparent = grandparent.parent().unwrap();
+        if !node_matches!(great_grandparent, NodeValue::List(..)) {
             return;
         }
 
@@ -2181,8 +2567,12 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
         sourcepos.start.column += end;
         parent.data.borrow_mut().sourcepos.start.column += end;
 
-        parent.parent().unwrap().data.borrow_mut().value =
+        grandparent.data.borrow_mut().value =
             NodeValue::TaskItem(if symbol == ' ' { None } else { Some(symbol) });
+
+        if let NodeValue::List(ref mut list) = &mut great_grandparent.data.borrow_mut().value {
+            list.is_task_list = true;
+        }
     }
 
     fn parse_reference_inline(&mut self, content: &[u8]) -> Option<usize> {
@@ -2194,10 +2584,8 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             self.options,
             content,
             0, // XXX -1 in upstream; never used?
-            0,
             &mut self.refmap,
             &delimiter_arena,
-            self.callback.as_mut(),
         );
 
         let mut lab: String = match subj.link_label() {
@@ -2249,9 +2637,9 @@ impl<'a, 'o, 'c> Parser<'a, 'o, 'c> {
             }
         }
 
-        lab = strings::normalize_label(&lab, Case::DontPreserve);
+        lab = strings::normalize_label(&lab, Case::Fold);
         if !lab.is_empty() {
-            subj.refmap.map.entry(lab).or_insert(Reference {
+            subj.refmap.map.entry(lab).or_insert(ResolvedReference {
                 url: String::from_utf8(strings::clean_url(url)).unwrap(),
                 title: String::from_utf8(strings::clean_title(&title)).unwrap(),
             });
@@ -2300,6 +2688,7 @@ fn parse_list_marker(
                 delimiter: ListDelimType::Period,
                 bullet_char: c,
                 tight: false,
+                is_task_list: false,
             },
         ));
     } else if isdigit(c) {
@@ -2355,6 +2744,7 @@ fn parse_list_marker(
                 },
                 bullet_char: 0,
                 tight: false,
+                is_task_list: false,
             },
         ));
     }
@@ -2417,7 +2807,7 @@ pub enum AutolinkType {
 
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-/// Options for bulleted list redering in markdown. See `link_style` in [RenderOptions] for more details.
+/// Options for bulleted list redering in markdown. See `link_style` in [`RenderOptions`] for more details.
 pub enum ListStyleType {
     /// The `-` character
     #[default]

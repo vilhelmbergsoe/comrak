@@ -63,25 +63,24 @@ impl<'w> Write for WriteWithLast<'w> {
     }
 }
 
-/// Converts header Strings to canonical, unique, but still human-readable, anchors.
+/// Converts header strings to canonical, unique, but still human-readable,
+/// anchors.
 ///
-/// To guarantee uniqueness, an anchorizer keeps track of the anchors
-/// it has returned.  So, for example, to parse several MarkDown
-/// files, use a new anchorizer per file.
+/// To guarantee uniqueness, an anchorizer keeps track of the anchors it has
+/// returned; use one per output file.
 ///
 /// ## Example
 ///
 /// ```
-/// use comrak::Anchorizer;
-///
+/// # use comrak::Anchorizer;
 /// let mut anchorizer = Anchorizer::new();
-///
 /// // First "stuff" is unsuffixed.
 /// assert_eq!("stuff".to_string(), anchorizer.anchorize("Stuff".to_string()));
 /// // Second "stuff" has "-1" appended to make it unique.
 /// assert_eq!("stuff-1".to_string(), anchorizer.anchorize("Stuff".to_string()));
 /// ```
 #[derive(Debug, Default)]
+#[doc(hidden)]
 pub struct Anchorizer(HashSet<String>);
 
 impl Anchorizer {
@@ -96,12 +95,9 @@ impl Anchorizer {
     /// resultant anchor unique.
     ///
     /// ```
-    /// use comrak::Anchorizer;
-    ///
+    /// # use comrak::Anchorizer;
     /// let mut anchorizer = Anchorizer::new();
-    ///
     /// let source = "Ticks aren't in";
-    ///
     /// assert_eq!("ticks-arent-in".to_string(), anchorizer.anchorize(source.to_string()));
     /// ```
     pub fn anchorize(&mut self, header: String) -> String {
@@ -291,7 +287,7 @@ pub fn escape(output: &mut dyn Write, buffer: &[u8]) -> io::Result<()> {
 /// The inclusion of characters like "%" in those which are not escaped is
 /// explained somewhat here:
 ///
-/// https://github.com/github/cmark-gfm/blob/c32ef78bae851cb83b7ad52d0fbff880acdcd44a/src/houdini_href_e.c#L7-L31
+/// <https://github.com/github/cmark-gfm/blob/c32ef78bae851cb83b7ad52d0fbff880acdcd44a/src/houdini_href_e.c#L7-L31>
 ///
 /// In other words, if a CommonMark user enters:
 ///
@@ -480,18 +476,27 @@ impl<'o> HtmlFormatter<'o> {
             NodeValue::List(ref nl) => {
                 if entering {
                     self.cr()?;
-                    if nl.list_type == ListType::Bullet {
-                        self.output.write_all(b"<ul")?;
-                        self.render_sourcepos(node)?;
-                        self.output.write_all(b">\n")?;
-                    } else if nl.start == 1 {
-                        self.output.write_all(b"<ol")?;
-                        self.render_sourcepos(node)?;
-                        self.output.write_all(b">\n")?;
-                    } else {
-                        self.output.write_all(b"<ol")?;
-                        self.render_sourcepos(node)?;
-                        writeln!(self.output, " start=\"{}\">", nl.start)?;
+                    match nl.list_type {
+                        ListType::Bullet => {
+                            self.output.write_all(b"<ul")?;
+                            if nl.is_task_list && self.options.render.tasklist_classes {
+                                self.output.write_all(b" class=\"contains-task-list\"")?;
+                            }
+                            self.render_sourcepos(node)?;
+                            self.output.write_all(b">\n")?;
+                        }
+                        ListType::Ordered => {
+                            self.output.write_all(b"<ol")?;
+                            if nl.is_task_list && self.options.render.tasklist_classes {
+                                self.output.write_all(b" class=\"contains-task-list\"")?;
+                            }
+                            self.render_sourcepos(node)?;
+                            if nl.start == 1 {
+                                self.output.write_all(b">\n")?;
+                            } else {
+                                writeln!(self.output, " start=\"{}\">", nl.start)?;
+                            }
+                        }
                     }
                 } else if nl.list_type == ListType::Bullet {
                     self.output.write_all(b"</ul>\n")?;
@@ -727,22 +732,29 @@ impl<'o> HtmlFormatter<'o> {
                 }
             }
             NodeValue::Text(ref literal) => {
+                // Nowhere to put sourcepos.
                 if entering {
                     self.escape(literal.as_bytes())?;
                 }
             }
             NodeValue::LineBreak => {
+                // Unreliable sourcepos.
                 if entering {
                     self.output.write_all(b"<br")?;
-                    self.render_sourcepos(node)?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output.write_all(b" />\n")?;
                 }
             }
             NodeValue::SoftBreak => {
+                // Unreliable sourcepos.
                 if entering {
                     if self.options.render.hardbreaks {
                         self.output.write_all(b"<br")?;
-                        self.render_sourcepos(node)?;
+                        if self.options.render.experimental_inline_sourcepos {
+                            self.render_sourcepos(node)?;
+                        }
                         self.output.write_all(b" />\n")?;
                     } else {
                         self.output.write_all(b"\n")?;
@@ -750,9 +762,12 @@ impl<'o> HtmlFormatter<'o> {
                 }
             }
             NodeValue::Code(NodeCode { ref literal, .. }) => {
+                // Unreliable sourcepos.
                 if entering {
                     self.output.write_all(b"<code")?;
-                    self.render_sourcepos(node)?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output.write_all(b">")?;
                     self.escape(literal.as_bytes())?;
                     self.output.write_all(b"</code>")?;
@@ -775,13 +790,17 @@ impl<'o> HtmlFormatter<'o> {
                 }
             }
             NodeValue::Strong => {
+                // Unreliable sourcepos.
                 let parent_node = node.parent();
-                if parent_node.is_none()
-                    || !matches!(parent_node.unwrap().data.borrow().value, NodeValue::Strong)
+                if !self.options.render.gfm_quirks
+                    || (parent_node.is_none()
+                        || !matches!(parent_node.unwrap().data.borrow().value, NodeValue::Strong))
                 {
                     if entering {
                         self.output.write_all(b"<strong")?;
-                        self.render_sourcepos(node)?;
+                        if self.options.render.experimental_inline_sourcepos {
+                            self.render_sourcepos(node)?;
+                        }
                         self.output.write_all(b">")?;
                     } else {
                         self.output.write_all(b"</strong>")?;
@@ -789,58 +808,94 @@ impl<'o> HtmlFormatter<'o> {
                 }
             }
             NodeValue::Emph => {
+                // Unreliable sourcepos.
                 if entering {
                     self.output.write_all(b"<em")?;
-                    self.render_sourcepos(node)?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output.write_all(b">")?;
                 } else {
                     self.output.write_all(b"</em>")?;
                 }
             }
             NodeValue::Strikethrough => {
+                // Unreliable sourcepos.
                 if entering {
                     self.output.write_all(b"<del")?;
-                    self.render_sourcepos(node)?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output.write_all(b">")?;
                 } else {
                     self.output.write_all(b"</del>")?;
                 }
             }
             NodeValue::Superscript => {
+                // Unreliable sourcepos.
                 if entering {
                     self.output.write_all(b"<sup")?;
-                    self.render_sourcepos(node)?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output.write_all(b">")?;
                 } else {
                     self.output.write_all(b"</sup>")?;
                 }
             }
             NodeValue::Link(ref nl) => {
-                if entering {
-                    self.output.write_all(b"<a")?;
-                    self.render_sourcepos(node)?;
-                    self.output.write_all(b" href=\"")?;
-                    let url = nl.url.as_bytes();
-                    if self.options.render.unsafe_ || !dangerous_url(url) {
-                        self.escape_href(url)?;
+                // Unreliable sourcepos.
+                let parent_node = node.parent();
+
+                if !self.options.parse.relaxed_autolinks
+                    || (parent_node.is_none()
+                        || !matches!(
+                            parent_node.unwrap().data.borrow().value,
+                            NodeValue::Link(..)
+                        ))
+                {
+                    if entering {
+                        self.output.write_all(b"<a")?;
+                        if self.options.render.experimental_inline_sourcepos {
+                            self.render_sourcepos(node)?;
+                        }
+                        self.output.write_all(b" href=\"")?;
+                        let url = nl.url.as_bytes();
+                        if self.options.render.unsafe_ || !dangerous_url(url) {
+                            if let Some(rewriter) = &self.options.extension.link_url_rewriter {
+                                self.escape_href(rewriter.to_html(&nl.url).as_bytes())?;
+                            } else {
+                                self.escape_href(url)?;
+                            }
+                        }
+                        if !nl.title.is_empty() {
+                            self.output.write_all(b"\" title=\"")?;
+                            self.escape(nl.title.as_bytes())?;
+                        }
+                        self.output.write_all(b"\">")?;
+                    } else {
+                        self.output.write_all(b"</a>")?;
                     }
-                    if !nl.title.is_empty() {
-                        self.output.write_all(b"\" title=\"")?;
-                        self.escape(nl.title.as_bytes())?;
-                    }
-                    self.output.write_all(b"\">")?;
-                } else {
-                    self.output.write_all(b"</a>")?;
                 }
             }
             NodeValue::Image(ref nl) => {
+                // Unreliable sourcepos.
                 if entering {
+                    if self.options.render.figure_with_caption {
+                        self.output.write_all(b"<figure>")?;
+                    }
                     self.output.write_all(b"<img")?;
-                    self.render_sourcepos(node)?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output.write_all(b" src=\"")?;
                     let url = nl.url.as_bytes();
                     if self.options.render.unsafe_ || !dangerous_url(url) {
-                        self.escape_href(url)?;
+                        if let Some(rewriter) = &self.options.extension.image_url_rewriter {
+                            self.escape_href(rewriter.to_html(&nl.url).as_bytes())?;
+                        } else {
+                            self.escape_href(url)?;
+                        }
                     }
                     self.output.write_all(b"\" alt=\"")?;
                     return Ok(true);
@@ -850,12 +905,21 @@ impl<'o> HtmlFormatter<'o> {
                         self.escape(nl.title.as_bytes())?;
                     }
                     self.output.write_all(b"\" />")?;
+                    if self.options.render.figure_with_caption {
+                        if !nl.title.is_empty() {
+                            self.output.write_all(b"<figcaption>")?;
+                            self.escape(nl.title.as_bytes())?;
+                            self.output.write_all(b"</figcaption>")?;
+                        }
+                        self.output.write_all(b"</figure>")?;
+                    }
                 }
             }
             #[cfg(feature = "shortcodes")]
             NodeValue::ShortCode(ref nsc) => {
+                // Nowhere to put sourcepos.
                 if entering {
-                    self.output.write_all(nsc.emoji().as_bytes())?;
+                    self.output.write_all(nsc.emoji.as_bytes())?;
                 }
             }
             NodeValue::Table(..) => {
@@ -971,16 +1035,17 @@ impl<'o> HtmlFormatter<'o> {
                 }
             }
             NodeValue::FootnoteReference(ref nfr) => {
+                // Unreliable sourcepos.
                 if entering {
                     let mut ref_id = format!("fnref-{}", nfr.name);
-
-                    self.output.write_all(b"<sup")?;
-                    self.render_sourcepos(node)?;
-
                     if nfr.ref_num > 1 {
                         ref_id = format!("{}-{}", ref_id, nfr.ref_num);
                     }
 
+                    self.output.write_all(b"<sup")?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
                     self.output
                         .write_all(b" class=\"footnote-ref\"><a href=\"#fn-")?;
                     self.escape_href(nfr.name.as_bytes())?;
@@ -993,17 +1058,20 @@ impl<'o> HtmlFormatter<'o> {
                 if entering {
                     self.cr()?;
                     self.output.write_all(b"<li")?;
+                    if self.options.render.tasklist_classes {
+                        self.output.write_all(b" class=\"task-list-item\"")?;
+                    }
                     self.render_sourcepos(node)?;
                     self.output.write_all(b">")?;
-                    write!(
-                        self.output,
-                        "<input type=\"checkbox\" {}disabled=\"\" /> ",
-                        if symbol.is_some() {
-                            "checked=\"\" "
-                        } else {
-                            ""
-                        }
-                    )?;
+                    self.output.write_all(b"<input type=\"checkbox\"")?;
+                    if self.options.render.tasklist_classes {
+                        self.output
+                            .write_all(b" class=\"task-list-item-checkbox\"")?;
+                    }
+                    if symbol.is_some() {
+                        self.output.write_all(b" checked=\"\"")?;
+                    }
+                    self.output.write_all(b" disabled=\"\" /> ")?;
                 } else {
                     self.output.write_all(b"</li>\n")?;
                 }
@@ -1020,10 +1088,13 @@ impl<'o> HtmlFormatter<'o> {
                 }
             }
             NodeValue::Escaped => {
+                // Unreliable sourcepos.
                 if self.options.render.escaped_char_spans {
                     if entering {
                         self.output.write_all(b"<span data-escaped-char")?;
-                        self.render_sourcepos(node)?;
+                        if self.options.render.experimental_inline_sourcepos {
+                            self.render_sourcepos(node)?;
+                        }
                         self.output.write_all(b">")?;
                     } else {
                         self.output.write_all(b"</span>")?;
@@ -1039,6 +1110,52 @@ impl<'o> HtmlFormatter<'o> {
                 if entering {
                     self.render_math_inline(node, literal, display_math, dollar_math)?;
                 }
+            }
+            NodeValue::WikiLink(ref nl) => {
+                // Unreliable sourcepos.
+                if entering {
+                    self.output.write_all(b"<a")?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
+                    self.output.write_all(b" href=\"")?;
+                    let url = nl.url.as_bytes();
+                    if self.options.render.unsafe_ || !dangerous_url(url) {
+                        self.escape_href(url)?;
+                    }
+                    self.output.write_all(b"\" data-wikilink=\"true")?;
+                    self.output.write_all(b"\">")?;
+                } else {
+                    self.output.write_all(b"</a>")?;
+                }
+            }
+            NodeValue::Underline => {
+                // Unreliable sourcepos.
+                if entering {
+                    self.output.write_all(b"<u")?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
+                    self.output.write_all(b">")?;
+                } else {
+                    self.output.write_all(b"</u>")?;
+                }
+            }
+            NodeValue::SpoileredText => {
+                // Unreliable sourcepos.
+                if entering {
+                    self.output.write_all(b"<span")?;
+                    if self.options.render.experimental_inline_sourcepos {
+                        self.render_sourcepos(node)?;
+                    }
+                    self.output.write_all(b" class=\"spoiler\">")?;
+                } else {
+                    self.output.write_all(b"</span>")?;
+                }
+            }
+            NodeValue::EscapedTag(ref net) => {
+                // Nowhere to put sourcepos.
+                self.output.write_all(net.as_bytes())?;
             }
         }
         Ok(false)
@@ -1097,7 +1214,8 @@ impl<'o> HtmlFormatter<'o> {
 
         tag_attributes.push((String::from("data-math-style"), String::from(style_attr)));
 
-        if self.options.render.sourcepos {
+        // Unreliable sourcepos.
+        if self.options.render.experimental_inline_sourcepos && self.options.render.sourcepos {
             let ast = node.data.borrow();
             tag_attributes.push(("data-sourcepos".to_string(), ast.sourcepos.to_string()));
         }

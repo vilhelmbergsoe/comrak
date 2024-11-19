@@ -120,6 +120,35 @@ fn setext_heading_sourcepos() {
 }
 
 #[test]
+fn ignore_setext_heading() {
+    html_opts!(
+        [render.ignore_setext],
+        concat!("text text\n---"),
+        concat!("<p>text text</p>\n<hr />\n"),
+    );
+}
+
+#[test]
+fn figure_with_caption_with_title() {
+    html_opts!(
+        [render.figure_with_caption],
+        concat!("![image](https://example.com/image.png \"this is an image\")\n"),
+        concat!("<p><figure><img src=\"https://example.com/image.png\" alt=\"image\" title=\"this is an image\" /><figcaption>this is an image</figcaption></figure></p>\n"),
+    );
+}
+
+#[test]
+fn figure_with_caption_without_title() {
+    html_opts!(
+        [render.figure_with_caption],
+        concat!("![image](https://example.com/image.png)\n"),
+        concat!(
+            "<p><figure><img src=\"https://example.com/image.png\" alt=\"image\" /></figure></p>\n"
+        ),
+    );
+}
+
+#[test]
 fn html_block_1() {
     html_opts!(
         [render.unsafe_],
@@ -415,6 +444,14 @@ fn reference_links() {
 }
 
 #[test]
+fn reference_links_casefold() {
+    html(
+        concat!("[ẞ]\n", "\n", "[SS]: /url	\n",),
+        "<p><a href=\"/url\">ẞ</a></p>\n",
+    );
+}
+
+#[test]
 fn safety() {
     html(
         concat!(
@@ -476,5 +513,240 @@ fn case_insensitive_safety() {
     html(
         "[a](javascript:a) [b](Javascript:b) [c](jaVascript:c) [d](data:xyz) [e](Data:xyz) [f](vbscripT:f) [g](FILE:g)\n",
         "<p><a href=\"\">a</a> <a href=\"\">b</a> <a href=\"\">c</a> <a href=\"\">d</a> <a href=\"\">e</a> <a href=\"\">f</a> <a href=\"\">g</a></p>\n",
+    );
+}
+
+#[test]
+fn link_sourcepos_baseline() {
+    assert_ast_match!(
+        [],
+        "[ABCD](/)\n",
+        (document (1:1-1:9) [
+            (paragraph (1:1-1:9) [
+                (link (1:1-1:9) [
+                    (text (1:2-1:5) "ABCD")
+                ])
+            ])
+        ])
+    );
+}
+
+// https://github.com/kivikakk/comrak/issues/301
+#[test]
+fn link_sourcepos_newline() {
+    assert_ast_match!(
+        [],
+        "[AB\nCD](/)\n",
+        (document (1:1-2:6) [
+            (paragraph (1:1-2:6) [
+                (link (1:1-2:6) [
+                    (text (1:2-1:3) "AB")
+                    (softbreak (1:4-1:4))
+                    (text (2:1-2:2) "CD")
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn link_sourcepos_truffle() {
+    assert_ast_match!(
+        [],
+        "- A\n[![B](/B.png)](/B)\n",
+        (document (1:1-2:18) [
+            (list (1:1-2:18) [
+                (item (1:1-2:18) [
+                    (paragraph (1:3-2:18) [
+                        (text (1:3-1:3) "A")
+                        (softbreak (1:4-1:4))
+                        (link (2:1-2:18) [
+                            (image (2:2-2:13) [
+                                (text (2:4-2:4) "B")
+                            ])
+                        ])
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn link_sourcepos_truffle_twist() {
+    assert_ast_match!(
+        [],
+        "- A\n  [![B](/B.png)](/B)\n",
+        (document (1:1-2:20) [
+            (list (1:1-2:20) [
+                (item (1:1-2:20) [
+                    (paragraph (1:3-2:20) [
+                        (text (1:3-1:3) "A")
+                        (softbreak (1:4-1:4))
+                        (link (2:3-2:20) [
+                            (image (2:4-2:15) [
+                                (text (2:6-2:6) "B")
+                            ])
+                        ])
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn link_sourcepos_truffle_bergamot() {
+    assert_ast_match!(
+        [],
+        "- A\n   [![B](/B.png)](/B)\n",
+        (document (1:1-2:21) [
+            (list (1:1-2:21) [
+                (item (1:1-2:21) [
+                    (paragraph (1:3-2:21) [
+                        (text (1:3-1:3) "A")
+                        (softbreak (1:4-1:4))
+                        (link (2:4-2:21) [
+                            (image (2:5-2:16) [
+                                (text (2:7-2:7) "B")
+                            ])
+                        ])
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn paragraph_sourcepos_multiline() {
+    assert_ast_match!(
+        [],
+        "  A\n"
+        "   B\n",
+        (document (1:1-2:4) [
+            (paragraph (1:3-2:4) [
+                (text (1:3-1:3) "A")
+                (softbreak (1:4-1:4))
+                (text (2:4-2:4) "B")
+            ])
+        ])
+    );
+}
+
+#[test]
+fn listitem_sourcepos_multiline() {
+    assert_ast_match!(
+        [],
+        "- A\n"
+        "B\n",
+        (document (1:1-2:1) [
+            (list (1:1-2:1) [
+                (item (1:1-2:1) [
+                    (paragraph (1:3-2:1) [
+                        (text (1:3-1:3) "A")
+                        (softbreak (1:4-1:4))
+                        (text (2:1-2:1) "B")
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn listitem_sourcepos_multiline_2() {
+    assert_ast_match!(
+        [],
+        "- A\n"
+        "   B\n"
+        "-  C\n"
+        " D",
+        (document (1:1-4:2) [
+            (list (1:1-4:2) [
+                (item (1:1-2:4) [
+                    (paragraph (1:3-2:4) [
+                        (text (1:3-1:3) "A")
+                        (softbreak (1:4-1:4))
+                        (text (2:4-2:4) "B")
+                    ])
+                ])
+                (item (3:1-4:2) [
+                    (paragraph (3:4-4:2) [
+                        (text (3:4-3:4) "C")
+                        (softbreak (3:5-3:5))
+                        (text (4:2-4:2) "D")
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn emphasis_sourcepos_double_1() {
+    assert_ast_match!(
+        [],
+        "_**this**_\n",
+        (document (1:1-1:10) [
+            (paragraph (1:1-1:10) [
+                (emph (1:1-1:10) [
+                    (strong (1:2-1:9) [
+                        (text (1:4-1:7) "this")
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn emphasis_sourcepos_double_2() {
+    assert_ast_match!(
+        [],
+        "**_this_**\n",
+        (document (1:1-1:10) [
+            (paragraph (1:1-1:10) [
+                (strong (1:1-1:10) [
+                    (emph (1:3-1:8) [
+                        (text (1:4-1:7) "this")
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn emphasis_sourcepos_double_3() {
+    assert_ast_match!(
+        [],
+        "___this___\n",
+        (document (1:1-1:10) [
+            (paragraph (1:1-1:10) [
+                (emph (1:1-1:10) [
+                    (strong (1:2-1:9) [
+                        (text (1:4-1:7) "this")
+                    ])
+                ])
+            ])
+        ])
+    );
+}
+
+#[test]
+fn emphasis_sourcepos_double_4() {
+    assert_ast_match!(
+        [],
+        "***this***\n",
+        (document (1:1-1:10) [
+            (paragraph (1:1-1:10) [
+                (emph (1:1-1:10) [
+                    (strong (1:2-1:9) [
+                        (text (1:4-1:7) "this")
+                    ])
+                ])
+            ])
+        ])
     );
 }

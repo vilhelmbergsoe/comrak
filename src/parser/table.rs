@@ -13,7 +13,7 @@ use super::inlines::count_newlines;
 const MAX_AUTOCOMPLETED_CELLS: usize = 500_000;
 
 pub fn try_opening_block<'a>(
-    parser: &mut Parser<'a, '_, '_>,
+    parser: &mut Parser<'a, '_>,
     container: &'a AstNode<'a>,
     line: &[u8],
 ) -> Option<(&'a AstNode<'a>, bool, bool)> {
@@ -30,7 +30,7 @@ pub fn try_opening_block<'a>(
 }
 
 fn try_opening_header<'a>(
-    parser: &mut Parser<'a, '_, '_>,
+    parser: &mut Parser<'a, '_>,
     container: &'a AstNode<'a>,
     line: &[u8],
 ) -> Option<(&'a AstNode<'a>, bool, bool)> {
@@ -42,12 +42,14 @@ fn try_opening_header<'a>(
         return Some((container, false, false));
     }
 
-    let delimiter_row = match row(&line[parser.first_nonspace..]) {
+    let spoiler = parser.options.extension.spoiler;
+
+    let delimiter_row = match row(&line[parser.first_nonspace..], spoiler) {
         Some(delimiter_row) => delimiter_row,
         None => return Some((container, false, true)),
     };
 
-    let header_row = match row(container.data.borrow().content.as_bytes()) {
+    let header_row = match row(container.data.borrow().content.as_bytes(), spoiler) {
         Some(header_row) => header_row,
         None => return Some((container, false, true)),
     };
@@ -114,6 +116,10 @@ fn try_opening_header<'a>(
             start.column_add((cell.end_offset - header_row.paragraph_offset) as isize);
         ast.internal_offset = cell.internal_offset;
         ast.content.clone_from(&cell.content);
+        ast.line_offsets.push(
+            start.column + cell.start_offset - 1 + cell.internal_offset
+                - header_row.paragraph_offset,
+        );
 
         i += 1;
     }
@@ -127,7 +133,7 @@ fn try_opening_header<'a>(
 }
 
 fn try_opening_row<'a>(
-    parser: &mut Parser<'a, '_, '_>,
+    parser: &mut Parser<'a, '_>,
     container: &'a AstNode<'a>,
     alignments: &[TableAlignment],
     line: &[u8],
@@ -141,7 +147,8 @@ fn try_opening_row<'a>(
     }
 
     let sourcepos = container.data.borrow().sourcepos;
-    let this_row = match row(&line[parser.first_nonspace..]) {
+    let spoiler = parser.options.extension.spoiler;
+    let this_row = match row(&line[parser.first_nonspace..], spoiler) {
         Some(this_row) => this_row,
         None => return None,
     };
@@ -169,6 +176,9 @@ fn try_opening_row<'a>(
         cell_ast.internal_offset = cell.internal_offset;
         cell_ast.sourcepos.end.column = sourcepos.start.column + cell.end_offset;
         cell_ast.content.clone_from(&cell.content);
+        cell_ast
+            .line_offsets
+            .push(sourcepos.start.column + cell.start_offset - 1 + cell.internal_offset);
 
         last_column = cell_ast.sourcepos.end.column;
 
@@ -200,7 +210,7 @@ struct Cell {
     content: String,
 }
 
-fn row(string: &[u8]) -> Option<Row> {
+fn row(string: &[u8], spoiler: bool) -> Option<Row> {
     let len = string.len();
     let mut cells: Vec<Cell> = vec![];
 
@@ -211,7 +221,7 @@ fn row(string: &[u8]) -> Option<Row> {
     let mut max_columns_abort = false;
 
     while offset < len && expect_more_cells {
-        let cell_matched = scanners::table_cell(&string[offset..]).unwrap_or(0);
+        let cell_matched = scanners::table_cell(&string[offset..], spoiler).unwrap_or(0);
         let pipe_matched = scanners::table_cell_end(&string[offset + cell_matched..]).unwrap_or(0);
 
         if cell_matched > 0 || pipe_matched > 0 {
@@ -270,7 +280,7 @@ fn row(string: &[u8]) -> Option<Row> {
 }
 
 fn try_inserting_table_header_paragraph<'a>(
-    parser: &mut Parser<'a, '_, '_>,
+    parser: &mut Parser<'a, '_>,
     container: &'a AstNode<'a>,
     paragraph_offset: usize,
 ) {
@@ -292,16 +302,13 @@ fn try_inserting_table_header_paragraph<'a>(
     let mut paragraph = Ast::new(NodeValue::Paragraph, start);
     paragraph.sourcepos.end.line = start.line + newlines - 1;
 
-    // XXX We don't have the last_line_length to go on by this point,
-    // so we have no idea what the end column should be.
-    // We can't track it in row() like we do paragraph_offset, because
-    // we've already discarded the leading whitespace for that line.
-    // This is hard to avoid with this backtracking approach to
-    // creating the pre-table paragraph — we're doing the work of
-    // finalize() here, but without the parser state at that time.
-    // Approximate by just counting the line length as it is and adding
-    // to the start column.
-    paragraph.sourcepos.end.column = start.column - 1
+    // copy over the line offsets related to the paragraph
+    for n in 0..newlines {
+        paragraph.line_offsets.push(container_ast.line_offsets[n]);
+    }
+
+    let last_line_offset = *paragraph.line_offsets.last().unwrap_or(&0);
+    paragraph.sourcepos.end.column = last_line_offset
         + preface
             .iter()
             .rev()
@@ -365,6 +372,6 @@ fn get_num_autocompleted_cells<'a>(container: &'a AstNode<'a>) -> usize {
     };
 }
 
-pub fn matches(line: &[u8]) -> bool {
-    row(line).is_some()
+pub fn matches(line: &[u8], spoiler: bool) -> bool {
+    row(line, spoiler).is_some()
 }

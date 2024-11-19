@@ -2,14 +2,17 @@ use crate::arena_tree::Node;
 use crate::ctype::{isdigit, ispunct, isspace};
 use crate::entity;
 use crate::nodes::{
-    Ast, AstNode, NodeCode, NodeFootnoteReference, NodeLink, NodeMath, NodeValue, Sourcepos,
+    Ast, AstNode, NodeCode, NodeFootnoteReference, NodeLink, NodeMath, NodeValue, NodeWikiLink,
+    Sourcepos,
 };
+use crate::parser::autolink;
 #[cfg(feature = "shortcodes")]
 use crate::parser::shortcodes::NodeShortCode;
-use crate::parser::{unwrap_into_2, unwrap_into_copy, AutolinkType, Callback, Options, Reference};
+use crate::parser::{
+    unwrap_into_2, unwrap_into_copy, AutolinkType, BrokenLinkReference, Options, ResolvedReference,
+};
 use crate::scanners;
-use crate::strings;
-use crate::strings::Case;
+use crate::strings::{self, is_blank, Case};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -22,14 +25,14 @@ const MAXBACKTICKS: usize = 80;
 const MAX_LINK_LABEL_LENGTH: usize = 1000;
 const MAX_MATH_DOLLARS: usize = 2;
 
-pub struct Subject<'a: 'd, 'r, 'o, 'd, 'i, 'c: 'subj, 'subj> {
+pub struct Subject<'a: 'd, 'r, 'o, 'd, 'i> {
     pub arena: &'a Arena<AstNode<'a>>,
     options: &'o Options,
     pub input: &'i [u8],
     line: usize,
     pub pos: usize,
-    block_offset: usize,
     column_offset: isize,
+    line_offset: usize,
     flags: Flags,
     pub refmap: &'r mut RefMap,
     delimiter_arena: &'d Arena<Delimiter<'a, 'd>>,
@@ -42,10 +45,6 @@ pub struct Subject<'a: 'd, 'r, 'o, 'd, 'i, 'c: 'subj, 'subj> {
     special_chars: [bool; 256],
     skip_chars: [bool; 256],
     smart_chars: [bool; 256],
-    // Need to borrow the callback from the parser only for the lifetime of the Subject, 'subj, and
-    // then give it back when the Subject goes out of scope. Needs to be a mutable reference so we
-    // can call the FnMut and let it mutate its captured variables.
-    callback: Option<&'subj mut Callback<'c>>,
 }
 
 #[derive(Default)]
@@ -57,7 +56,7 @@ struct Flags {
 }
 
 pub struct RefMap {
-    pub map: HashMap<String, Reference>,
+    pub map: HashMap<String, ResolvedReference>,
     pub(crate) max_ref_size: usize,
     ref_size: usize,
 }
@@ -71,7 +70,7 @@ impl RefMap {
         }
     }
 
-    fn lookup(&mut self, lab: &str) -> Option<Reference> {
+    fn lookup(&mut self, lab: &str) -> Option<ResolvedReference> {
         match self.map.get(lab) {
             Some(entry) => {
                 let size = entry.url.len() + entry.title.len();
@@ -105,16 +104,20 @@ struct Bracket<'a> {
     bracket_after: bool,
 }
 
-impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
+#[derive(Clone, Copy)]
+struct WikilinkComponents<'i> {
+    url: &'i [u8],
+    link_label: Option<(&'i [u8], usize, usize)>,
+}
+
+impl<'a, 'r, 'o, 'd, 'i> Subject<'a, 'r, 'o, 'd, 'i> {
     pub fn new(
         arena: &'a Arena<AstNode<'a>>,
         options: &'o Options,
         input: &'i [u8],
         line: usize,
-        block_offset: usize,
         refmap: &'r mut RefMap,
         delimiter_arena: &'d Arena<Delimiter<'a, 'd>>,
-        callback: Option<&'subj mut Callback<'c>>,
     ) -> Self {
         let mut s = Subject {
             arena,
@@ -122,8 +125,8 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             input,
             line,
             pos: 0,
-            block_offset,
             column_offset: 0,
+            line_offset: 0,
             flags: Flags::default(),
             refmap,
             delimiter_arena,
@@ -136,12 +139,15 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             special_chars: [false; 256],
             skip_chars: [false; 256],
             smart_chars: [false; 256],
-            callback,
         };
         for &c in &[
             b'\n', b'\r', b'_', b'*', b'"', b'`', b'\\', b'&', b'<', b'[', b']', b'!', b'$',
         ] {
             s.special_chars[c as usize] = true;
+        }
+        if options.extension.autolink {
+            s.special_chars[b':' as usize] = true;
+            s.special_chars[b'w' as usize] = true;
         }
         if options.extension.strikethrough {
             s.special_chars[b'~' as usize] = true;
@@ -153,6 +159,12 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
         #[cfg(feature = "shortcodes")]
         if options.extension.shortcodes {
             s.special_chars[b':' as usize] = true;
+        }
+        if options.extension.underline {
+            s.special_chars[b'_' as usize] = true;
+        }
+        if options.extension.spoiler {
+            s.special_chars[b'|' as usize] = true;
         }
         for &c in &[b'"', b'\'', b'.', b'-'] {
             s.smart_chars[c as usize] = true;
@@ -169,6 +181,11 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             None => return false,
             Some(ch) => *ch as char,
         };
+
+        let node_ast = node.data.borrow();
+        let adjusted_line = self.line - node_ast.sourcepos.start.line;
+        self.line_offset = node_ast.line_offsets[adjusted_line];
+
         let new_inl: Option<&'a AstNode<'a>> = match c {
             '\0' => return false,
             '\r' | '\n' => Some(self.handle_newline()),
@@ -176,18 +193,69 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             '\\' => Some(self.handle_backslash()),
             '&' => Some(self.handle_entity()),
             '<' => Some(self.handle_pointy_brace()),
-            #[cfg(feature = "shortcodes")]
-            ':' if self.options.extension.shortcodes => Some(self.handle_colons()),
+            ':' => {
+                let mut res = None;
+
+                if self.options.extension.autolink {
+                    res = self.handle_autolink_colon(node);
+                }
+
+                #[cfg(feature = "shortcodes")]
+                if res.is_none() && self.options.extension.shortcodes {
+                    res = self.handle_shortcodes_colon();
+                }
+
+                if res.is_none() {
+                    self.pos += 1;
+                    res = Some(self.make_inline(
+                        NodeValue::Text(":".to_string()),
+                        self.pos - 1,
+                        self.pos - 1,
+                    ));
+                }
+
+                res
+            }
+            'w' if self.options.extension.autolink => match self.handle_autolink_w(node) {
+                Some(inl) => Some(inl),
+                None => {
+                    self.pos += 1;
+                    Some(self.make_inline(
+                        NodeValue::Text("w".to_string()),
+                        self.pos - 1,
+                        self.pos - 1,
+                    ))
+                }
+            },
             '*' | '_' | '\'' | '"' => Some(self.handle_delim(c as u8)),
             '-' => Some(self.handle_hyphen()),
             '.' => Some(self.handle_period()),
             '[' => {
                 self.pos += 1;
-                let inl =
-                    self.make_inline(NodeValue::Text("[".to_string()), self.pos - 1, self.pos - 1);
-                self.push_bracket(false, inl);
-                self.within_brackets = true;
-                Some(inl)
+
+                let mut wikilink_inl = None;
+
+                if (self.options.extension.wikilinks_title_after_pipe
+                    || self.options.extension.wikilinks_title_before_pipe)
+                    && !self.within_brackets
+                    && self.peek_char() == Some(&(b'['))
+                {
+                    wikilink_inl = self.handle_wikilink();
+                }
+
+                if wikilink_inl.is_none() {
+                    let inl = self.make_inline(
+                        NodeValue::Text("[".to_string()),
+                        self.pos - 1,
+                        self.pos - 1,
+                    );
+                    self.push_bracket(false, inl);
+                    self.within_brackets = true;
+
+                    Some(inl)
+                } else {
+                    wikilink_inl
+                }
             }
             ']' => {
                 self.within_brackets = false;
@@ -203,6 +271,7 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
                         self.pos - 1,
                     );
                     self.push_bracket(true, inl);
+                    self.within_brackets = true;
                     Some(inl)
                 } else {
                     Some(self.make_inline(
@@ -217,6 +286,7 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
                 Some(self.handle_delim(b'^'))
             }
             '$' => Some(self.handle_dollars()),
+            '|' if self.options.extension.spoiler => Some(self.handle_delim(b'|')),
             _ => {
                 let endpos = self.find_special_char();
                 let mut contents = self.input[self.pos..endpos].to_vec();
@@ -314,7 +384,7 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
         // This array is an important optimization that prevents searching down
         // the stack for openers we've previously searched for and know don't
         // exist, preventing exponential blowup on pathological cases.
-        let mut openers_bottom: [usize; 11] = [stack_bottom; 11];
+        let mut openers_bottom: [usize; 12] = [stack_bottom; 12];
 
         // This is traversing the stack from the top to the bottom, setting `closer` to
         // the delimiter directly above `stack_bottom`. In the case where we are processing
@@ -338,12 +408,13 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
                 let mut mod_three_rule_invoked = false;
 
                 let ix = match c.delim_char {
-                    b'~' => 0,
-                    b'^' => 1,
-                    b'"' => 2,
-                    b'\'' => 3,
-                    b'_' => 4,
-                    b'*' => 5 + (if c.can_open { 3 } else { 0 }) + (c.length % 3),
+                    b'|' => 0,
+                    b'~' => 1,
+                    b'^' => 2,
+                    b'"' => 3,
+                    b'\'' => 4,
+                    b'_' => 5,
+                    b'*' => 6 + (if c.can_open { 3 } else { 0 }) + (c.length % 3),
                     _ => unreachable!(),
                 };
 
@@ -392,6 +463,7 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
                     || c.delim_char == b'_'
                     || (self.options.extension.strikethrough && c.delim_char == b'~')
                     || (self.options.extension.superscript && c.delim_char == b'^')
+                    || (self.options.extension.spoiler && c.delim_char == b'|')
                 {
                     if opener_found {
                         // Finally, here's the happy case where the delimiters
@@ -926,20 +998,22 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
 
         let left_flanking = numdelims > 0
             && !after_char.is_whitespace()
-            && !(after_char.is_punctuation()
+            && !((after_char.is_punctuation() || after_char.is_symbol())
                 && !before_char.is_whitespace()
-                && !before_char.is_punctuation());
+                && !(before_char.is_punctuation() || before_char.is_symbol()));
         let right_flanking = numdelims > 0
             && !before_char.is_whitespace()
-            && !(before_char.is_punctuation()
+            && !((before_char.is_punctuation() || before_char.is_symbol())
                 && !after_char.is_whitespace()
-                && !after_char.is_punctuation());
+                && !(after_char.is_punctuation() || after_char.is_symbol()));
 
         if c == b'_' {
             (
                 numdelims,
-                left_flanking && (!right_flanking || before_char.is_punctuation()),
-                right_flanking && (!left_flanking || after_char.is_punctuation()),
+                left_flanking
+                    && (!right_flanking || before_char.is_punctuation() || before_char.is_symbol()),
+                right_flanking
+                    && (!left_flanking || after_char.is_punctuation() || after_char.is_symbol()),
             )
         } else if c == b'\'' || c == b'"' {
             (
@@ -1031,6 +1105,14 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
                 NodeValue::Strikethrough
             } else if self.options.extension.superscript && opener_char == b'^' {
                 NodeValue::Superscript
+            } else if self.options.extension.spoiler && opener_char == b'|' {
+                if use_delims == 2 {
+                    NodeValue::SpoileredText
+                } else {
+                    NodeValue::EscapedTag("|".to_owned())
+                }
+            } else if self.options.extension.underline && opener_char == b'_' && use_delims == 2 {
+                NodeValue::Underline
             } else if use_delims == 1 {
                 NodeValue::Emph
             } else {
@@ -1041,11 +1123,18 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             self.pos,
         );
         {
+            // if we have `___` or `***` then we need to adjust the sourcepos colums by 1
+            let triple_adjustment = if opener_num_chars > 0 && use_delims == 2 {
+                1
+            } else {
+                0
+            };
+
             emph.data.borrow_mut().sourcepos = (
                 opener.inl.data.borrow().sourcepos.start.line,
-                opener.inl.data.borrow().sourcepos.start.column,
+                opener.inl.data.borrow().sourcepos.start.column + triple_adjustment,
                 closer.inl.data.borrow().sourcepos.end.line,
-                closer.inl.data.borrow().sourcepos.end.column,
+                closer.inl.data.borrow().sourcepos.end.column - triple_adjustment,
             )
                 .into();
         }
@@ -1140,25 +1229,82 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
     }
 
     #[cfg(feature = "shortcodes")]
-    pub fn handle_colons(&mut self) -> &'a AstNode<'a> {
-        self.pos += 1;
+    pub fn handle_shortcodes_colon(&mut self) -> Option<&'a AstNode<'a>> {
+        let matchlen = scanners::shortcode(&self.input[self.pos + 1..])?;
 
-        if let Some(matchlen) = scanners::shortcode(&self.input[self.pos..]) {
-            let shortcode =
-                unsafe { str::from_utf8_unchecked(&self.input[self.pos..self.pos + matchlen - 1]) };
+        let shortcode = unsafe {
+            str::from_utf8_unchecked(&self.input[self.pos + 1..self.pos + 1 + matchlen - 1])
+        };
 
-            if let Ok(nsc) = NodeShortCode::try_from(shortcode) {
-                self.pos += matchlen;
-                let inl = self.make_inline(
-                    NodeValue::ShortCode(nsc),
-                    self.pos - 1 - matchlen,
-                    self.pos - 1,
-                );
-                return inl;
+        let nsc = NodeShortCode::resolve(shortcode)?;
+        self.pos += 1 + matchlen;
+
+        Some(self.make_inline(
+            NodeValue::ShortCode(nsc),
+            self.pos - 1 - matchlen,
+            self.pos - 1,
+        ))
+    }
+
+    pub fn handle_autolink_with<F>(
+        &mut self,
+        node: &'a AstNode<'a>,
+        f: F,
+    ) -> Option<&'a AstNode<'a>>
+    where
+        F: Fn(
+            &'a Arena<AstNode<'a>>,
+            &[u8],
+            usize,
+            bool,
+        ) -> Option<(&'a AstNode<'a>, usize, usize)>,
+    {
+        if !self.options.parse.relaxed_autolinks && self.within_brackets {
+            return None;
+        }
+        let (post, mut reverse, skip) = f(
+            self.arena,
+            self.input,
+            self.pos,
+            self.options.parse.relaxed_autolinks,
+        )?;
+
+        self.pos += skip - reverse;
+
+        // We need to "rewind" by `reverse` chars, which should be in one or
+        // more Text nodes beforehand. Typically the chars will *all* be in a
+        // single Text node, containing whatever text came before the ":" that
+        // triggered this method, eg. "See our website at http" ("://blah.com").
+        //
+        // relaxed_autolinks allows some slightly pathological cases. First,
+        // "://…" is a possible parse, meaning `reverse == 0`. There may also be
+        // a scheme including the letter "w", which will split Text inlines due
+        // to them being their own trigger (for handle_autolink_w), meaning
+        // "wa://…" will need to traverse two Texts to complete the rewind.
+        while reverse > 0 {
+            match node.last_child().unwrap().data.borrow_mut().value {
+                NodeValue::Text(ref mut prev) => {
+                    if reverse < prev.len() {
+                        prev.truncate(prev.len() - reverse);
+                        reverse = 0;
+                    } else {
+                        reverse -= prev.len();
+                        node.last_child().unwrap().detach();
+                    }
+                }
+                _ => panic!("expected text node before autolink colon"),
             }
         }
 
-        self.make_inline(NodeValue::Text(":".to_string()), self.pos - 1, self.pos - 1)
+        Some(post)
+    }
+
+    pub fn handle_autolink_colon(&mut self, node: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
+        self.handle_autolink_with(node, autolink::url_match)
+    }
+
+    pub fn handle_autolink_w(&mut self, node: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
+        self.handle_autolink_with(node, autolink::www_match)
     }
 
     pub fn handle_pointy_brace(&mut self) -> &'a AstNode<'a> {
@@ -1302,6 +1448,32 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             ));
         }
 
+        // Ensure there was text if this was a link and not an image link
+        if self.options.render.ignore_empty_links && !is_image {
+            let mut non_blank_found = false;
+            let mut tmpch = self.brackets[brackets_len - 1].inl_text.next_sibling();
+            while let Some(tmp) = tmpch {
+                match tmp.data.borrow().value {
+                    NodeValue::Text(ref s) if is_blank(s.as_bytes()) => (),
+                    _ => {
+                        non_blank_found = true;
+                        break;
+                    }
+                }
+
+                tmpch = tmp.next_sibling();
+            }
+
+            if !non_blank_found {
+                self.brackets.pop();
+                return Some(self.make_inline(
+                    NodeValue::Text("]".to_string()),
+                    self.pos - 1,
+                    self.pos - 1,
+                ));
+            }
+        }
+
         let after_link_text_pos = self.pos;
 
         // Try to find a link destination within parenthesis
@@ -1365,7 +1537,8 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
         }
 
         // Need to normalize both to lookup in refmap and to call callback
-        let lab = strings::normalize_label(&lab, Case::DontPreserve);
+        let unfolded_lab = lab.to_owned();
+        let lab = strings::normalize_label(&lab, Case::Fold);
         let mut reff = if found_label {
             self.refmap.lookup(&lab)
         } else {
@@ -1374,8 +1547,11 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
 
         // Attempt to use the provided broken link callback if a reference cannot be resolved
         if reff.is_none() {
-            if let Some(ref mut callback) = self.callback {
-                reff = callback(&lab).map(|(url, title)| Reference { url, title });
+            if let Some(callback) = &self.options.parse.broken_link_callback {
+                reff = callback.resolve(BrokenLinkReference {
+                    normalized: &lab,
+                    original: &unfolded_lab,
+                });
             }
         }
 
@@ -1439,7 +1615,7 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
                 inl.data.borrow_mut().sourcepos.start.column =
                     bracket_inl_text.data.borrow().sourcepos.start.column;
                 inl.data.borrow_mut().sourcepos.end.column = usize::try_from(
-                    self.pos as isize + self.column_offset + self.block_offset as isize,
+                    self.pos as isize + self.column_offset + self.line_offset as isize,
                 )
                 .unwrap();
                 bracket_inl_text.insert_before(inl);
@@ -1483,15 +1659,14 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             self.pos,
             self.pos,
         );
-        inl.data.borrow_mut().sourcepos.start.column = self.brackets[brackets_len - 1]
+        inl.data.borrow_mut().sourcepos.start = self.brackets[brackets_len - 1]
             .inl_text
             .data
             .borrow()
             .sourcepos
-            .start
-            .column;
+            .start;
         inl.data.borrow_mut().sourcepos.end.column =
-            usize::try_from(self.pos as isize + self.column_offset + self.block_offset as isize)
+            usize::try_from(self.pos as isize + self.column_offset + self.line_offset as isize)
                 .unwrap();
 
         self.brackets[brackets_len - 1].inl_text.insert_before(inl);
@@ -1548,6 +1723,183 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
         }
     }
 
+    // Handles wikilink syntax
+    //   [[link text|url]]
+    //   [[url|link text]]
+    pub fn handle_wikilink(&mut self) -> Option<&'a AstNode<'a>> {
+        let startpos = self.pos;
+        let component = self.wikilink_url_link_label()?;
+        let url_clean = strings::clean_url(component.url);
+        let (link_label, link_label_start_column, _link_label_end_column) =
+            match component.link_label {
+                Some((label, sc, ec)) => (entity::unescape_html(label), sc, ec),
+                None => (
+                    entity::unescape_html(component.url),
+                    startpos + 1,
+                    self.pos - 3,
+                ),
+            };
+
+        let nl = NodeWikiLink {
+            url: String::from_utf8(url_clean).unwrap(),
+        };
+        let inl = self.make_inline(NodeValue::WikiLink(nl), startpos - 1, self.pos - 1);
+
+        self.label_backslash_escapes(inl, link_label, link_label_start_column);
+
+        Some(inl)
+    }
+
+    fn wikilink_url_link_label(&mut self) -> Option<WikilinkComponents<'i>> {
+        let left_startpos = self.pos;
+
+        if self.peek_char() != Some(&(b'[')) {
+            return None;
+        }
+
+        let found_left = self.wikilink_component();
+
+        if !found_left {
+            self.pos = left_startpos;
+            return None;
+        }
+
+        let left = strings::trim_slice(&self.input[left_startpos + 1..self.pos]);
+
+        if self.peek_char() == Some(&(b']')) && self.peek_char_n(1) == Some(&(b']')) {
+            self.pos += 2;
+            return Some(WikilinkComponents {
+                url: left,
+                link_label: None,
+            });
+        } else if self.peek_char() != Some(&(b'|')) {
+            self.pos = left_startpos;
+            return None;
+        }
+
+        let right_startpos = self.pos;
+        let found_right = self.wikilink_component();
+
+        if !found_right {
+            self.pos = left_startpos;
+            return None;
+        }
+
+        let right = strings::trim_slice(&self.input[right_startpos + 1..self.pos]);
+
+        if self.peek_char() == Some(&(b']')) && self.peek_char_n(1) == Some(&(b']')) {
+            self.pos += 2;
+
+            if self.options.extension.wikilinks_title_after_pipe {
+                Some(WikilinkComponents {
+                    url: left,
+                    link_label: Some((right, right_startpos + 1, self.pos - 3)),
+                })
+            } else {
+                Some(WikilinkComponents {
+                    url: right,
+                    link_label: Some((left, left_startpos + 1, right_startpos - 1)),
+                })
+            }
+        } else {
+            self.pos = left_startpos;
+            None
+        }
+    }
+
+    // Locates the edge of a wikilink component (link label or url), and sets the
+    // self.pos to it's end if it's found.
+    fn wikilink_component(&mut self) -> bool {
+        let startpos = self.pos;
+
+        if self.peek_char() != Some(&(b'[')) && self.peek_char() != Some(&(b'|')) {
+            return false;
+        }
+
+        self.pos += 1;
+
+        let mut length = 0;
+        let mut c = 0;
+        while unwrap_into_copy(self.peek_char(), &mut c) && c != b'[' && c != b']' && c != b'|' {
+            if c == b'\\' {
+                self.pos += 1;
+                length += 1;
+                if self.peek_char().map_or(false, |&c| ispunct(c)) {
+                    self.pos += 1;
+                    length += 1;
+                }
+            } else {
+                self.pos += 1;
+                length += 1;
+            }
+            if length > MAX_LINK_LABEL_LENGTH {
+                self.pos = startpos;
+                return false;
+            }
+        }
+
+        true
+    }
+
+    // Given a label, handles backslash escaped characters. Appends the resulting
+    // nodes to the container
+    fn label_backslash_escapes(
+        &mut self,
+        container: &'a AstNode<'a>,
+        label: Vec<u8>,
+        start_column: usize,
+    ) {
+        let mut startpos = 0;
+        let mut offset = 0;
+        let len = label.len();
+
+        while offset < len {
+            let c = label[offset];
+
+            if c == b'\\' && (offset + 1) < len && ispunct(label[offset + 1]) {
+                let preceding_text = self.make_inline(
+                    NodeValue::Text(String::from_utf8(label[startpos..offset].to_owned()).unwrap()),
+                    start_column + startpos,
+                    start_column + offset - 1,
+                );
+
+                container.append(preceding_text);
+
+                let inline_text = self.make_inline(
+                    NodeValue::Text(String::from_utf8(vec![label[offset + 1]]).unwrap()),
+                    start_column + offset,
+                    start_column + offset + 1,
+                );
+
+                if self.options.render.escaped_char_spans {
+                    let span = self.make_inline(
+                        NodeValue::Escaped,
+                        start_column + offset,
+                        start_column + offset + 1,
+                    );
+
+                    span.append(inline_text);
+                    container.append(span);
+                } else {
+                    container.append(inline_text);
+                }
+
+                offset += 2;
+                startpos = offset;
+            } else {
+                offset += 1;
+            }
+        }
+
+        if startpos != offset {
+            container.append(self.make_inline(
+                NodeValue::Text(String::from_utf8(label[startpos..offset].to_owned()).unwrap()),
+                start_column + startpos,
+                start_column + offset - 1,
+            ));
+        }
+    }
+
     pub fn spnl(&mut self) {
         self.skip_spaces();
         if self.skip_line_end() {
@@ -1562,8 +1914,8 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
         end_column: usize,
     ) -> &'a AstNode<'a> {
         let start_column =
-            start_column as isize + 1 + self.column_offset + self.block_offset as isize;
-        let end_column = end_column as isize + 1 + self.column_offset + self.block_offset as isize;
+            start_column as isize + 1 + self.column_offset + self.line_offset as isize;
+        let end_column = end_column as isize + 1 + self.column_offset + self.line_offset as isize;
 
         let ast = Ast {
             value,
@@ -1579,6 +1931,7 @@ impl<'a, 'r, 'o, 'd, 'i, 'c, 'subj> Subject<'a, 'r, 'o, 'd, 'i, 'c, 'subj> {
             open: false,
             last_line_blank: false,
             table_visited: false,
+            line_offsets: Vec::with_capacity(0),
         };
         self.arena.alloc(Node::new(RefCell::new(ast)))
     }
@@ -1687,6 +2040,7 @@ pub fn make_inline<'a>(
         open: false,
         last_line_blank: false,
         table_visited: false,
+        line_offsets: Vec::with_capacity(0),
     };
     arena.alloc(Node::new(RefCell::new(ast)))
 }

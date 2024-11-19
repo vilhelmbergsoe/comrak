@@ -2,9 +2,8 @@
 #![feature(int_roundings)]
 #![no_main]
 use comrak::{
-    markdown_to_html, markdown_to_commonmark, markdown_to_commonmark_xml,
-    ExtensionOptions, Options, ParseOptions,
-    RenderOptions, ListStyleType,
+    markdown_to_commonmark, markdown_to_commonmark_xml, markdown_to_html, ExtensionOptions,
+    ListStyleType, Options, ParseOptions, RenderOptions,
 };
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
@@ -196,6 +195,8 @@ struct FuzzExtensionOptions {
     math_dollars: bool,
     math_code: bool,
     shortcodes: bool,
+    wikilinks_title_after_pipe: bool,
+    wikilinks_title_before_pipe: bool,
 }
 
 impl FuzzExtensionOptions {
@@ -213,6 +214,8 @@ impl FuzzExtensionOptions {
         extension.math_dollars = self.math_dollars;
         extension.math_code = self.math_code;
         extension.shortcodes = self.shortcodes;
+        extension.wikilinks_title_after_pipe = self.wikilinks_title_after_pipe;
+        extension.wikilinks_title_before_pipe = self.wikilinks_title_before_pipe;
         extension.front_matter_delimiter = None;
         extension.header_ids = None;
         extension
@@ -293,18 +296,10 @@ fn fuzz_one_input(input: &Input, num_bytes: usize) -> (usize, Duration, f64) {
     let duration_per_byte = duration.as_secs_f64() / (byte_length as f64);
 
     if DEBUG {
-        println!(
-            "do_one: {} bytes, duration = {:?}",
-            byte_length,
-            duration
-        );
+        println!("do_one: {} bytes, duration = {:?}", byte_length, duration);
     }
 
-    (
-        byte_length,
-        duration,
-        duration_per_byte
-    )
+    (byte_length, duration, duration_per_byte)
 }
 
 /// The maximum number of steps to run in the main fuzzing loop below.

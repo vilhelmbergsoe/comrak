@@ -1,9 +1,8 @@
 //! The `comrak` binary.
 
 use comrak::{
-    adapters::SyntaxHighlighterAdapter, plugins::syntect::SyntectAdapter, Arena,
-    ExtensionOptionsBuilder, ListStyleType, Options, ParseOptionsBuilder, Plugins,
-    RenderOptionsBuilder,
+    adapters::SyntaxHighlighterAdapter, plugins::syntect::SyntectAdapter, Arena, ListStyleType,
+    Options, Plugins,
 };
 use std::boxed::Box;
 use std::env;
@@ -14,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use in_place::InPlace;
+use comrak::{ExtensionOptions, ParseOptions, RenderOptions};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_PARSE_CONFIG: i32 = 2;
@@ -57,10 +56,16 @@ struct Cli {
     #[arg(long)]
     full_info_string: bool,
 
-    /// Enable GitHub-flavored markdown extensions: strikethrough, tagfilter, table, autolink, and tasklist.
-    /// Also enables --github-pre-lang.
+    /// Enable GitHub-flavored markdown extensions: strikethrough, tagfilter,
+    /// table, autolink, and tasklist. Also enables --github-pre-lang and
+    /// --gfm-quirks.
     #[arg(long)]
     gfm: bool,
+
+    /// Enables GFM-style quirks in output HTML, such as not nesting <strong>
+    /// tags, which otherwise breaks CommonMark compatibility.
+    #[arg(long)]
+    gfm_quirks: bool,
 
     /// Enable relaxing which character is allowed in a tasklists.
     #[arg(long)]
@@ -70,6 +75,10 @@ struct Cli {
     /// and allow all url schemes
     #[arg(long)]
     relaxed_autolinks: bool,
+
+    /// Output classes on tasklist elements so that they can be styled with CSS
+    #[arg(long)]
+    tasklist_classes: bool,
 
     /// Default value for fenced code block's info strings if none is given
     #[arg(long, value_name = "INFO")]
@@ -135,6 +144,18 @@ struct Cli {
     /// Include source position attribute in HTML and XML output
     #[arg(long)]
     sourcepos: bool,
+
+    /// Include inline sourcepos in HTML output, which is known to have issues.
+    #[arg(long)]
+    experimental_inline_sourcepos: bool,
+
+    /// Ignore setext headers
+    #[arg(long)]
+    ignore_setext: bool,
+
+    /// Ignore empty links
+    #[arg(long)]
+    ignore_empty_links: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -160,6 +181,11 @@ enum Extension {
     MultilineBlockQuotes,
     MathDollars,
     MathCode,
+    WikilinksTitleAfterPipe,
+    WikilinksTitleBeforePipe,
+    Underline,
+    Spoiler,
+    Greentext,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -225,37 +251,39 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let exts = &cli.extensions;
 
-    let mut extension = ExtensionOptionsBuilder::default();
-    extension
+    let extension = ExtensionOptions::builder()
         .strikethrough(exts.contains(&Extension::Strikethrough) || cli.gfm)
         .tagfilter(exts.contains(&Extension::Tagfilter) || cli.gfm)
         .table(exts.contains(&Extension::Table) || cli.gfm)
         .autolink(exts.contains(&Extension::Autolink) || cli.gfm)
         .tasklist(exts.contains(&Extension::Tasklist) || cli.gfm)
         .superscript(exts.contains(&Extension::Superscript))
-        .header_ids(cli.header_ids)
+        .maybe_header_ids(cli.header_ids)
         .footnotes(exts.contains(&Extension::Footnotes))
         .description_lists(exts.contains(&Extension::DescriptionLists))
         .multiline_block_quotes(exts.contains(&Extension::MultilineBlockQuotes))
         .math_dollars(exts.contains(&Extension::MathDollars))
         .math_code(exts.contains(&Extension::MathCode))
-        .front_matter_delimiter(cli.front_matter_delimiter);
+        .wikilinks_title_after_pipe(exts.contains(&Extension::WikilinksTitleAfterPipe))
+        .wikilinks_title_before_pipe(exts.contains(&Extension::WikilinksTitleBeforePipe))
+        .underline(exts.contains(&Extension::Underline))
+        .spoiler(exts.contains(&Extension::Spoiler))
+        .greentext(exts.contains(&Extension::Greentext))
+        .maybe_front_matter_delimiter(cli.front_matter_delimiter);
 
     #[cfg(feature = "shortcodes")]
-    {
-        extension.shortcodes(cli.gemojis);
-    }
+    let extension = extension.shortcodes(cli.gemojis);
 
-    let extension = extension.build()?;
+    let extension = extension.build();
 
-    let parse = ParseOptionsBuilder::default()
+    let parse = ParseOptions::builder()
         .smart(cli.smart)
-        .default_info_string(cli.default_info_string)
+        .maybe_default_info_string(cli.default_info_string)
         .relaxed_tasklist_matching(cli.relaxed_tasklist_character)
         .relaxed_autolinks(cli.relaxed_autolinks)
-        .build()?;
+        .build();
 
-    let render = RenderOptionsBuilder::default()
+    let render = RenderOptions::builder()
         .hardbreaks(cli.hardbreaks)
         .github_pre_lang(cli.github_pre_lang || cli.gfm)
         .full_info_string(cli.full_info_string)
@@ -264,8 +292,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .escape(cli.escape)
         .list_style(cli.list_style.into())
         .sourcepos(cli.sourcepos)
+        .experimental_inline_sourcepos(cli.experimental_inline_sourcepos)
         .escaped_char_spans(cli.escaped_char_spans)
-        .build()?;
+        .ignore_setext(cli.ignore_setext)
+        .ignore_empty_links(cli.ignore_empty_links)
+        .gfm_quirks(cli.gfm_quirks || cli.gfm)
+        .tasklist_classes(cli.tasklist_classes)
+        .build();
 
     let options = Options {
         extension,
@@ -327,11 +360,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         formatter(root, &options, &mut bw, &plugins)?;
         bw.flush()?;
     } else if cli.inplace {
-        let inp: in_place::InPlaceFile =
-            InPlace::new(unsafe { cli.files.unwrap_unchecked().get_unchecked(0) }).open()?;
-        let mut bw = inp.writer();
+        let output_filename = cli.files.unwrap().get(0).unwrap().clone();
+        let mut bw = BufWriter::new(fs::File::create(output_filename)?);
         formatter(root, &options, &mut bw, &plugins)?;
-        inp.save()?;
+        bw.flush()?;
     } else {
         let stdout = std::io::stdout();
         let mut bw = BufWriter::new(stdout.lock());

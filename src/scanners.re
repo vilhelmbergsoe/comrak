@@ -24,7 +24,7 @@
 
     tagname = [A-Za-z][A-Za-z0-9-]*;
 
-    blocktagname = 'address'|'article'|'aside'|'base'|'basefont'|'blockquote'|'body'|'caption'|'center'|'col'|'colgroup'|'dd'|'details'|'dialog'|'dir'|'div'|'dl'|'dt'|'fieldset'|'figcaption'|'figure'|'footer'|'form'|'frame'|'frameset'|'h1'|'h2'|'h3'|'h4'|'h5'|'h6'|'head'|'header'|'hr'|'html'|'iframe'|'legend'|'li'|'link'|'main'|'menu'|'menuitem'|'nav'|'noframes'|'ol'|'optgroup'|'option'|'p'|'param'|'section'|'source'|'title'|'summary'|'table'|'tbody'|'td'|'tfoot'|'th'|'thead'|'title'|'tr'|'track'|'ul';
+    blocktagname = 'address'|'article'|'aside'|'base'|'basefont'|'blockquote'|'body'|'caption'|'center'|'col'|'colgroup'|'dd'|'details'|'dialog'|'dir'|'div'|'dl'|'dt'|'fieldset'|'figcaption'|'figure'|'footer'|'form'|'frame'|'frameset'|'h1'|'h2'|'h3'|'h4'|'h5'|'h6'|'head'|'header'|'hr'|'html'|'iframe'|'legend'|'li'|'link'|'main'|'menu'|'menuitem'|'nav'|'noframes'|'ol'|'optgroup'|'option'|'p'|'param'|'search'|'section'|'title'|'summary'|'table'|'tbody'|'td'|'tfoot'|'th'|'thead'|'title'|'tr'|'track'|'ul';
 
     attributename = [a-zA-Z_:][a-zA-Z0-9:._-]*;
 
@@ -313,11 +313,13 @@ pub fn dangerous_url(s: &[u8]) -> Option<usize> {
 
 /*!re2c
 
+    table_spoiler = ['|']['|'];
     table_spacechar = [ \t\v\f];
     table_newline = [\r]?[\n];
 
     table_delimiter = (table_spacechar*[:]?[-]+[:]?table_spacechar*);
     table_cell = (escaped_char|[^\x00|\r\n])+;
+    table_cell_spoiler = (escaped_char|table_spoiler|[^\x00|\r\n])+;
 
 */
 
@@ -333,17 +335,25 @@ pub fn table_start(s: &[u8]) -> Option<usize> {
 */
 }
 
-pub fn table_cell(s: &[u8]) -> Option<usize> {
+pub fn table_cell(s: &[u8], spoiler: bool) -> Option<usize> {
     let mut cursor = 0;
     let mut marker = 0;
     let len = s.len();
-/*!re2c
+
     // In fact, `table_cell` matches non-empty table cells only. The empty
     // string is also a valid table cell, but is handled by the default rule.
     // This approach prevents re2c's match-empty-string warning.
+    if spoiler {
+/*!re2c
+    table_cell_spoiler { return Some(cursor); }
+    * { return None; }
+*/
+    } else {
+/*!re2c
     table_cell { return Some(cursor); }
     * { return None; }
 */
+    }
 }
 
 pub fn table_cell_end(s: &[u8]) -> Option<usize> {
@@ -371,7 +381,7 @@ pub fn shortcode(s: &[u8]) -> Option<usize> {
     let mut marker = 0;
     let len = s.len();
 /*!re2c
-    [A-Za-z_-]+ [:] { return Some(cursor); }
+    [A-Za-z0-9+_-]+ [:] { return Some(cursor); }
     * { return None; }
 */
 }

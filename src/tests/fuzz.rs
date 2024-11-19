@@ -15,6 +15,15 @@ fn tasklist() {
 }
 
 #[test]
+fn tasklist_with_classes() {
+    html_opts!(
+        [extension.tasklist, render.tasklist_classes, parse.relaxed_tasklist_matching],
+        "* [*]",
+        "<ul class=\"contains-task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" class=\"task-list-item-checkbox\" checked=\"\" disabled=\"\" /> </li>\n</ul>\n",
+    );
+}
+
+#[test]
 fn table_nul() {
     html_opts!(
         [extension.table],
@@ -47,7 +56,7 @@ fn footnote_def() {
             render.hardbreaks
         ],
         "\u{15}\u{b}\r[^ ]:",
-        "<p data-sourcepos=\"1:1-2:5\">\u{15}\u{b}<br data-sourcepos=\"1:3-1:3\" />\n[^ ]:</p>\n",
+        "<p data-sourcepos=\"1:1-2:5\">\u{15}\u{b}<br />\n[^ ]:</p>\n",
     );
 }
 
